@@ -309,6 +309,9 @@ class UniversalReasoner(nnx.Module):
 
         z_seq, z_shared, all_time_embeds, ctx = self._prepare_reasoning_context(tokens, max_steps)
 
+        self.reason_stack.reset_state()
+        self.know_stack.reset_state()
+
         graphdef, state = nnx.split(self)
 
         def scan_step(carry, t_signal):
