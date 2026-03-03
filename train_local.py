@@ -52,7 +52,7 @@ class RotaryAttention(nnx.Module):
         self.v_proj = nnx.Linear(in_features, self.num_groups * self.head_dim, rngs=rngs, dtype=jnp.float32)
         self.o_proj = nnx.Linear(in_features, in_features, rngs=rngs, dtype=jnp.float32)
 
-    def __call__(self, x, context=None, mask=None, q_pos=None, kv_pos=None):
+    def __call__(self, x, context=None, mask=None, q_pos=None, kv_pos=None, use_cache=False):
         b, s, d = x.shape
         q = self.q_proj(x).reshape(b, s, self.num_heads, self.head_dim)
 
@@ -76,11 +76,12 @@ class RotaryAttention(nnx.Module):
         cos_kv = self.cos_cached[kv_pos, None, :]
         k = (k * cos_kv) + (rotate_half(k) * sin_kv)
 
-        if self.cache.value is not None:
-            prev_k, prev_v = self.cache.value
-            k = jnp.concatenate([prev_k, k], axis=1)
-            v = jnp.concatenate([prev_v, v], axis=1)
-        self.cache.value = (k, v)
+        if use_cache:
+            if self.cache.value is not None:
+                prev_k, prev_v = self.cache.value
+                k = jnp.concatenate([prev_k, k], axis=1)
+                v = jnp.concatenate([prev_v, v], axis=1)
+            self.cache.value = (k, v)
 
         repeats = self.num_heads // self.num_groups
         k_expanded = jnp.repeat(k, repeats, axis=2)
@@ -109,8 +110,8 @@ class StandardReasoningBlock(nnx.Module):
             rngs=rngs, dtype=dtype,
         )
 
-    def __call__(self, x, context=None, mask=None, q_pos=None, kv_pos=None, hyper_mods=None):
-        attn_out = self.attn(self.norm1(x), context=context, mask=mask, q_pos=q_pos, kv_pos=kv_pos)
+    def __call__(self, x, context=None, mask=None, q_pos=None, kv_pos=None, hyper_mods=None, use_cache=False):
+        attn_out = self.attn(self.norm1(x), context=context, mask=mask, q_pos=q_pos, kv_pos=kv_pos, use_cache=use_cache)
         x = x + attn_out
 
         mlp_in = self.norm2(x)
@@ -135,7 +136,7 @@ class BlockStack(nnx.Module):
         for block in self.blocks:
             block.attn.cache.value = None
 
-    def __call__(self, x, context=None, mask=None, q_pos=None, kv_pos=None, hyper_mods_list=None):
+    def __call__(self, x, context=None, mask=None, q_pos=None, kv_pos=None, hyper_mods_list=None, use_cache=False):
         if hyper_mods_list is None:
             mods = [None] * self.num_blocks
         elif isinstance(hyper_mods_list, tuple):
@@ -145,7 +146,7 @@ class BlockStack(nnx.Module):
             assert len(mods) == self.num_blocks
 
         for block, mod in zip(self.blocks, mods):
-            x = block(x, context=context, mask=mask, q_pos=q_pos, kv_pos=kv_pos, hyper_mods=mod)
+            x = block(x, context=context, mask=mask, q_pos=q_pos, kv_pos=kv_pos, hyper_mods=mod, use_cache=use_cache)
         return x
 
 
@@ -279,6 +280,7 @@ class UniversalReasoner(nnx.Module):
             q_pos=ctx['shared_pos'],
             kv_pos=shared_kv_pos,
             hyper_mods_list=hyper_mods,
+            use_cache=False,
         )
         shared_after_reason = new_reason_raw * ctx['reason_mask'] + curr_shared * (1.0 - ctx['reason_mask'])
 
@@ -290,6 +292,7 @@ class UniversalReasoner(nnx.Module):
             q_pos=ctx['shared_pos'],
             kv_pos=shared_kv_pos,
             hyper_mods_list=hyper_mods,
+            use_cache=False,
         )
         new_shared = new_know_raw * ctx['know_mask'] + shared_after_reason * (1.0 - ctx['know_mask'])
 
@@ -308,9 +311,6 @@ class UniversalReasoner(nnx.Module):
         self.know_stack.reset_state()
 
         z_seq, z_shared, all_time_embeds, ctx = self._prepare_reasoning_context(tokens, max_steps)
-
-        self.reason_stack.reset_state()
-        self.know_stack.reset_state()
 
         graphdef, state = nnx.split(self)
 
@@ -370,6 +370,7 @@ class UniversalReasoner(nnx.Module):
             q_pos=ctx['seq_pos'],
             kv_pos=shared_kv_pos,
             hyper_mods_list=ctx['hyper_mods'],
+            use_cache=False,
         )
         z_out = self.seq_norm(z_out)
 
