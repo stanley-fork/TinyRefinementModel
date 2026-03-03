@@ -45,12 +45,14 @@ class RotaryAttention(nnx.Module):
         self.sin_cached = jnp.sin(freqs)
         self.cos_cached = jnp.cos(freqs)
 
+        self.cache = nnx.Cache(None)
+
         self.q_proj = nnx.Linear(in_features, in_features, rngs=rngs, dtype=jnp.float32)
         self.k_proj = nnx.Linear(in_features, self.num_groups * self.head_dim, rngs=rngs, dtype=jnp.float32)
         self.v_proj = nnx.Linear(in_features, self.num_groups * self.head_dim, rngs=rngs, dtype=jnp.float32)
         self.o_proj = nnx.Linear(in_features, in_features, rngs=rngs, dtype=jnp.float32)
 
-    def __call__(self, x, context=None, mask=None, cache=None, q_pos=None, kv_pos=None):
+    def __call__(self, x, context=None, mask=None, q_pos=None, kv_pos=None):
         b, s, d = x.shape
         q = self.q_proj(x).reshape(b, s, self.num_heads, self.head_dim)
 
@@ -74,11 +76,11 @@ class RotaryAttention(nnx.Module):
         cos_kv = self.cos_cached[kv_pos, None, :]
         k = (k * cos_kv) + (rotate_half(k) * sin_kv)
 
-        if cache is not None:
-            prev_k, prev_v = cache
+        if self.cache.value is not None:
+            prev_k, prev_v = self.cache.value
             k = jnp.concatenate([prev_k, k], axis=1)
             v = jnp.concatenate([prev_v, v], axis=1)
-        new_cache = (k, v) if cache is not None else None
+        self.cache.value = (k, v)
 
         repeats = self.num_heads // self.num_groups
         k_expanded = jnp.repeat(k, repeats, axis=2)
@@ -89,7 +91,7 @@ class RotaryAttention(nnx.Module):
             mask=jnp.broadcast_to(mask, (mask.shape[0], self.num_heads, q.shape[1], k_expanded.shape[1]))
             if mask is not None else None,
         )
-        return self.o_proj(out.reshape(b, s, d)), new_cache
+        return self.o_proj(out.reshape(b, s, d))
 
 
 class StandardReasoningBlock(nnx.Module):
@@ -107,8 +109,8 @@ class StandardReasoningBlock(nnx.Module):
             rngs=rngs, dtype=dtype,
         )
 
-    def __call__(self, x, context=None, mask=None, cache=None, q_pos=None, kv_pos=None, hyper_mods=None):
-        attn_out, new_cache = self.attn(self.norm1(x), context=context, mask=mask, cache=cache, q_pos=q_pos, kv_pos=kv_pos)
+    def __call__(self, x, context=None, mask=None, q_pos=None, kv_pos=None, hyper_mods=None):
+        attn_out = self.attn(self.norm1(x), context=context, mask=mask, q_pos=q_pos, kv_pos=kv_pos)
         x = x + attn_out
 
         mlp_in = self.norm2(x)
@@ -118,7 +120,7 @@ class StandardReasoningBlock(nnx.Module):
 
         hidden = jax.nn.silu(self.gate_proj(mlp_in)) * self.up_proj(mlp_in)
         x = x + self.down_proj(hidden)
-        return x, new_cache
+        return x
 
 
 class BlockStack(nnx.Module):
@@ -128,6 +130,10 @@ class BlockStack(nnx.Module):
             for _ in range(num_blocks)
         ])
         self.num_blocks = num_blocks
+
+    def reset_state(self):
+        for block in self.blocks:
+            block.attn.cache.value = None
 
     def __call__(self, x, context=None, mask=None, q_pos=None, kv_pos=None, hyper_mods_list=None):
         if hyper_mods_list is None:
@@ -139,7 +145,7 @@ class BlockStack(nnx.Module):
             assert len(mods) == self.num_blocks
 
         for block, mod in zip(self.blocks, mods):
-            x, _ = block(x, context=context, mask=mask, q_pos=q_pos, kv_pos=kv_pos, hyper_mods=mod)
+            x = block(x, context=context, mask=mask, q_pos=q_pos, kv_pos=kv_pos, hyper_mods=mod)
         return x
 
 
@@ -298,33 +304,45 @@ class UniversalReasoner(nnx.Module):
         return new_shared, halt_prob, forget
 
     def __call__(self, tokens, max_steps=MAX_STEPS_LIMIT, training=False):
+        self.reason_stack.reset_state()
+        self.know_stack.reset_state()
+
         z_seq, z_shared, all_time_embeds, ctx = self._prepare_reasoning_context(tokens, max_steps)
 
+        graphdef, state = nnx.split(self)
+
         def scan_step(carry, t_signal):
-            curr_shared, p_remain_prev = carry
+            curr_shared, p_remain_prev, loop_state = carry
 
-            def full_compute(_):
-                return self._core_reasoning_step(z_seq, curr_shared, t_signal, ctx)
+            def full_compute(s):
+                m = nnx.merge(graphdef, s)
+                res = m._core_reasoning_step(z_seq, curr_shared, t_signal, ctx)
+                return res, nnx.state(m)
 
-            def skip_compute(_):
-                return curr_shared, jnp.ones_like(p_remain_prev), jnp.zeros_like(curr_shared)
+            def skip_compute(s):
+                res = (curr_shared, jnp.ones_like(p_remain_prev), jnp.zeros_like(curr_shared))
+                return res, s
 
             should_run = jnp.any(p_remain_prev > AWAKE_PROB_THRESHOLD)
-            new_shared, halt_prob, forget = jax.lax.cond(
-                should_run, full_compute, skip_compute, operand=None
+            (new_shared, halt_prob, forget), next_state = jax.lax.cond(
+                should_run, full_compute, skip_compute, operand=loop_state
             )
 
             step_forget_l1 = jnp.mean(jnp.abs(forget), axis=(1, 2))
             p_remain_next = p_remain_prev * (1.0 - halt_prob)
-            new_shared = self.shared_norm(new_shared)
 
-            return (new_shared, p_remain_next), (halt_prob, step_forget_l1)
+            m_norm = nnx.merge(graphdef, next_state)
+            new_shared = m_norm.shared_norm(new_shared)
+
+            return (new_shared, p_remain_next, nnx.state(m_norm)), (halt_prob, step_forget_l1)
 
         scan_fn = nnx.scan(nnx.remat(scan_step), in_axes=(nnx.Carry, 0))
         p_remain0 = jnp.ones((ctx['batch_size'],), dtype=z_seq.dtype)
-        (final_shared, _), (all_halts, all_forget_l1) = scan_fn(
-            (z_shared, p_remain0), all_time_embeds
+        (final_shared, _, final_loop_state), (all_halts, all_forget_l1) = scan_fn(
+            (z_shared, p_remain0, state), all_time_embeds
         )
+
+        nnx.update(self, final_loop_state)
 
         all_halts = jnp.clip(all_halts, 0.0, 1.0 - 1e-7)
         p_remain = jnp.concatenate(
@@ -371,26 +389,25 @@ optimizer = nnx.Optimizer(model, optimizer_chain, wrt=nnx.Param)
 
 
 @nnx.jit
-def train_step(m, opt, batch_tokens, step):
-    macro_step = step // ACCUMULATION_STEPS
-    curr_ponder_lambda = ponder_lambda_schedule(macro_step)
-    curr_forget_lambda = forget_lambda_schedule(macro_step)
+def train_step(model, opt, batch_tokens, step):
+    p_lambda = ponder_lambda_schedule(step // ACCUMULATION_STEPS)
+    f_lambda = forget_lambda_schedule(step // ACCUMULATION_STEPS)
 
-    def loss_fn(model_instance):
+    def loss_fn(model):
         inputs, targets = batch_tokens[:, :-1], batch_tokens[:, 1:]
 
-        preds, ponder_cost, forget_cost = model_instance(inputs, training=True)
+        preds, ponder_cost, forget_cost = model(inputs, training=True)
 
         ce_loss = optax.softmax_cross_entropy_with_integer_labels(logits=preds, labels=targets)
         token_loss = jnp.mean(ce_loss, where=(targets != PAD_TOKEN_ID))
 
         total_loss = (
             token_loss
-            + curr_ponder_lambda * jnp.mean(ponder_cost)
-            + curr_forget_lambda * jnp.mean(forget_cost)
+            + p_lambda * jnp.mean(ponder_cost)
+            + f_lambda * jnp.mean(forget_cost)
         ) / ACCUMULATION_STEPS
         return total_loss, (token_loss, jnp.mean(ponder_cost), jnp.mean(forget_cost))
 
-    (loss, aux), grads = nnx.value_and_grad(loss_fn, has_aux=True)(m)
-    opt.update(m, grads)
-    return loss, aux
+    grads, aux = nnx.grad(loss_fn, has_aux=True)(model)
+    opt.update(grads)
+    return aux
