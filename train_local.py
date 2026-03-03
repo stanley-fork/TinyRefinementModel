@@ -10,7 +10,7 @@ from flax import nnx
 import jax.numpy as jnp
 
 NUM_BLOCKS = 4
-LATENT_DIM = 512
+LATENT_DIM = 384
 BATCH_SIZE = 1
 ACCUMULATION_STEPS = 128
 MAX_STEPS_LIMIT = 16
@@ -413,5 +413,5 @@ def train_step(model, opt, batch_tokens, step):
         return total_loss, (token_loss, jnp.mean(ponder_cost), jnp.mean(forget_cost))
 
     grads, aux = nnx.grad(loss_fn, has_aux=True)(model)
-    opt.update(grads)
+    opt.update(model, grads)
     return aux
