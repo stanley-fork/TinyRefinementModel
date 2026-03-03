@@ -229,7 +229,7 @@ class UniversalReasoner(nnx.Module):
         reason_ratio = jax.nn.sigmoid(self.budget_head(seq_repr))
         normalized_indices = jnp.arange(SHARED_SLOTS) / SHARED_SLOTS
         raw_dist = reason_ratio - normalized_indices[None, :]
-        sharpness = jnp.exp(self.budget_temp.value) 
+        sharpness = jnp.exp(self.budget_temp.value)
         reason_mask = jax.nn.sigmoid(raw_dist * sharpness)[:, :, None]
         know_mask = 1.0 - reason_mask
         return reason_mask, know_mask
@@ -312,40 +312,38 @@ class UniversalReasoner(nnx.Module):
 
         z_seq, z_shared, all_time_embeds, ctx = self._prepare_reasoning_context(tokens, max_steps)
 
+        shared_norm_scale = self.shared_norm.scale.value
+
         graphdef, state = nnx.split(self)
 
         def scan_step(carry, t_signal):
-            curr_shared, p_remain_prev, loop_state = carry
+            curr_shared, p_remain_prev = carry
 
-            def full_compute(s):
-                m = nnx.merge(graphdef, s)
-                res = m._core_reasoning_step(z_seq, curr_shared, t_signal, ctx)
-                return res, nnx.state(m)
+            def full_compute(_):
+                m = nnx.merge(graphdef, state)
+                return m._core_reasoning_step(z_seq, curr_shared, t_signal, ctx)
 
-            def skip_compute(s):
-                res = (curr_shared, jnp.ones_like(p_remain_prev), jnp.zeros_like(curr_shared))
-                return res, s
+            def skip_compute(_):
+                return (curr_shared, jnp.ones_like(p_remain_prev), jnp.zeros_like(curr_shared))
 
             should_run = jnp.any(p_remain_prev > AWAKE_PROB_THRESHOLD)
-            (new_shared, halt_prob, forget), next_state = jax.lax.cond(
-                should_run, full_compute, skip_compute, operand=loop_state
+            new_shared, halt_prob, forget = jax.lax.cond(
+                should_run, full_compute, skip_compute, operand=None
             )
 
             step_forget_l1 = jnp.mean(jnp.abs(forget), axis=(1, 2))
             p_remain_next = p_remain_prev * (1.0 - halt_prob)
 
-            m_norm = nnx.merge(graphdef, next_state)
-            new_shared = m_norm.shared_norm(new_shared)
+            rms = jnp.sqrt(jnp.mean(new_shared ** 2, axis=-1, keepdims=True) + 1e-6)
+            new_shared = (new_shared / rms) * shared_norm_scale
 
-            return (new_shared, p_remain_next, nnx.state(m_norm)), (halt_prob, step_forget_l1)
+            return (new_shared, p_remain_next), (halt_prob, step_forget_l1)
 
-        scan_fn = nnx.scan(nnx.remat(scan_step), in_axes=(nnx.Carry, 0))
         p_remain0 = jnp.ones((ctx['batch_size'],), dtype=z_seq.dtype)
-        (final_shared, _, final_loop_state), (all_halts, all_forget_l1) = scan_fn(
-            (z_shared, p_remain0, state), all_time_embeds
-        )
 
-        nnx.update(self, final_loop_state)
+        (final_shared, _), (all_halts, all_forget_l1) = jax.lax.scan(
+            jax.checkpoint(scan_step), (z_shared, p_remain0), all_time_embeds
+        )
 
         all_halts = jnp.clip(all_halts, 0.0, 1.0 - 1e-7)
         p_remain = jnp.concatenate(
