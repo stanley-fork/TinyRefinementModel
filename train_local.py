@@ -378,8 +378,8 @@ class UniversalReasoner(nnx.Module):
 
 model = UniversalReasoner(LATENT_DIM, rngs=nnx.Rngs(0), num_blocks=NUM_BLOCKS)
 
-ponder_lambda_schedule = optax.linear_schedule(init_value=0.0, end_value=0.001, transition_steps=200)
-forget_lambda_schedule = optax.linear_schedule(init_value=0.0, end_value=5e-5, transition_steps=200)
+ponder_lambda_schedule = optax.linear_schedule(init_value=0.0, end_value=1e-4, transition_steps=1000)
+forget_lambda_schedule = optax.linear_schedule(init_value=0.0, end_value=5e-5, transition_steps=1000)
 
 schedule = optax.warmup_cosine_decay_schedule(1e-6, 1.5e-4, 200, 800, 5e-6)
 base_optimizer = optax.chain(

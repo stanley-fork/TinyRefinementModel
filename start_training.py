@@ -1,3 +1,4 @@
+import jax
 import jax.numpy as jnp
 from flax import nnx
 import orbax.checkpoint as ocp
@@ -23,8 +24,8 @@ if "HF_HUB_ENABLE_HF_TRANSFER" not in os.environ:
 
 CHECKPOINT_INTERVAL = 10
 SORT_BUFFER_SIZE = 10_000
+PREFETCH_SIZE = 4
 
-PREFETCH_SIZE = 4  # keep 4 batches ready ahead of time
 
 def start_prefetch_worker(data_gen, batch_size, q):
     def worker():
@@ -95,7 +96,7 @@ class TextDataGenerator:
 
 
 class LossMonitor:
-    def __init__(self, patience=200, window=500, max_ponder_limit=15):
+    def __init__(self, patience=500, window=500, max_ponder_limit=15):
         self.patience = patience
         self.window = window
         self.max_ponder_limit = max_ponder_limit
@@ -119,10 +120,6 @@ class LossMonitor:
         if (step - self.last_improvement_step) > self.patience:
             print(f"\n🛑 Plateau detected: No CE improvement > 0.01 for {self.patience} steps.")
             return True
-
-        if avg_ponder >= self.max_ponder_limit:
-            print(f"\n🛑 Saturation detected: Avg ponder steps maxed out at {avg_ponder:.2f}.")
-            return False
 
         return False
 
@@ -166,6 +163,10 @@ if __name__ == "__main__":
         monitor.best_ce = m_state["best_ce"]
         monitor.last_improvement_step = m_state["last_improvement_step"]
 
+        # Reset halt head bias to nudge model away from collapsed early-halting.
+        # This only affects the halt decision, not the learned representations.
+        model.halt_head.bias.value = jnp.full((1,), -2.0)
+        print(f"🔧 Reset halt_head bias to -2.0 to recover ponder depth")
         print(f"✅ Resuming from step {start_step}")
     else:
         print("🆕 No checkpoint found, starting from scratch...")
@@ -177,8 +178,10 @@ if __name__ == "__main__":
     step = start_step
     while True:
         t0 = time.time()
-        step_loss, step_ce, step_p, step_forget_cost = 0.0, 0.0, 0.0, 0.0
+        # Accumulate as JAX arrays — no float() sync inside the loop
+        step_loss = step_ce = step_p = step_forget_cost = 0.0
         last_loss = None
+        batch = None
 
         for i in range(ACCUMULATION_STEPS):
             batch = batch_queue.get()
@@ -188,24 +191,25 @@ if __name__ == "__main__":
             loss, (ce, p, forget_cost) = train_step(
                 model, optimizer, batch, step * ACCUMULATION_STEPS + i
             )
-            # DON'T block here — let GPU run async
 
-            step_ce += float(ce)  # these implicitly sync only once
-            step_p += float(p)
-            step_forget_cost += float(forget_cost)
-            step_loss += float(loss)
+            # Accumulate without forcing device sync each iteration
+            step_loss += loss
+            step_ce += ce
+            step_p += p
+            step_forget_cost += forget_cost
             last_loss = loss
 
         if batch is None:
             break
 
-        # Sync once per macro-step, not 128 times
+        # Single sync point for the whole macro-step
         if last_loss is not None:
             last_loss.block_until_ready()
 
-        step_ce /= ACCUMULATION_STEPS
-        step_p /= ACCUMULATION_STEPS
-        step_forget_cost /= ACCUMULATION_STEPS
+        step_loss = float(step_loss) / ACCUMULATION_STEPS
+        step_ce = float(step_ce) / ACCUMULATION_STEPS
+        step_p = float(step_p) / ACCUMULATION_STEPS
+        step_forget_cost = float(step_forget_cost) / ACCUMULATION_STEPS
 
         t_total = time.time() - t0
 
@@ -231,14 +235,16 @@ if __name__ == "__main__":
             mngr.wait_until_finished()
 
             print(
-                f"Step {step:04d} | Agg Loss: {step_loss:.4f} | Avg Steps: {step_p:.2f} | Forget: {step_forget_cost:.4f} | Time: {t_total:.2f}s"
+                f"Step {step:04d} | CE: {step_ce:.4f} | Agg Loss: {step_loss:.4f} | "
+                f"Avg Steps: {step_p:.2f} | Forget: {step_forget_cost:.4f} | Time: {t_total:.2f}s"
             )
 
+            write_header = not os.path.exists(history_file) or os.path.getsize(history_file) == 0
             with open(history_file, "a", newline="") as f:
                 writer = csv.DictWriter(
                     f, fieldnames=["step", "loss", "ce", "avg_ponder", "avg_forget_cost", "t_total"]
                 )
-                if f.tell() == 0:
+                if write_header:
                     writer.writeheader()
                 writer.writerow(
                     {
