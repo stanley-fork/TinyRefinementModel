@@ -33,7 +33,8 @@ def plot_training_history(log_path="training_history.csv"):
                     'loss': float(row['loss']),
                     'ce': float(row.get('ce', 0)),
                     'avg_ponder': float(row.get('avg_ponder', 0)),
-                    'avg_t_cost': float(row.get('avg_t_cost', 0)),
+                    # CSV writes avg_forget_cost; accept avg_t_cost for backward compatibility
+                    'avg_t_cost': float(row.get('avg_forget_cost', row.get('avg_t_cost', 0))),
                     't_total': float(row.get('t_total', 0))
                 })
     except Exception as e:
@@ -48,7 +49,7 @@ def plot_training_history(log_path="training_history.csv"):
     losses = np.array([entry['loss'] for entry in history])
     ce_losses = np.array([entry['ce'] for entry in history])
     ponder_steps = np.array([entry['avg_ponder'] for entry in history])
-    avg_t_costs = np.array([entry.get('avg_t_cost', 0) for entry in history])
+    avg_t_costs = np.array([entry['avg_t_cost'] for entry in history])
     times = np.array([entry['t_total'] for entry in history])
 
     plt.style.use('dark_background')
