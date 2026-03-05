@@ -13,14 +13,15 @@ NUM_BLOCKS = 4
 LATENT_DIM = 384
 BATCH_SIZE = 1
 ACCUMULATION_STEPS = 128
+MIN_STEPS = 4
 MAX_STEPS_LIMIT = 16
-SHARED_SLOTS = 256
+SHARED_SLOTS = 512
 MAX_SEQ_LEN = 1024
 VOCAB_SIZE = 100277
 PAD_TOKEN_ID = 100257
-PONDER_LAMBDA = 0.001
+PONDER_LAMBDA = 1e-4
 TEMP_LAMBDA = 1e-4
-HALT_TEMP = 2.5
+HALT_TEMP = 0.5
 FORGET_LAMBDA = 5e-5
 BUDGET_GATE_SHARPNESS = 10.0
 AWAKE_PROB_THRESHOLD = 1e-2
@@ -230,7 +231,7 @@ class UniversalReasoner(nnx.Module):
         reason_ratio = jax.nn.sigmoid(self.budget_head(seq_repr))
         normalized_indices = jnp.arange(SHARED_SLOTS) / SHARED_SLOTS
         raw_dist = reason_ratio - normalized_indices[None, :]
-        sharpness = jnp.exp(self.budget_temp.value)
+        sharpness = 1.0 + jax.nn.softplus(self.budget_temp.value)
         reason_mask = jax.nn.sigmoid(raw_dist * sharpness)[:, :, None]
         know_mask = 1.0 - reason_mask
         return reason_mask, know_mask
@@ -254,7 +255,21 @@ class UniversalReasoner(nnx.Module):
 
         z_seq = self.know_stack(z_seq, mask=seq_attn_mask, q_pos=seq_pos, kv_pos=seq_pos, hyper_mods_list=hyper_mods)
 
-        z_shared = jnp.broadcast_to(self.shared_token.value, (batch_size, SHARED_SLOTS, self.latent_dim))
+        # Initialize shared memory from token context (one-time expensive step)
+        z_shared = jnp.tile(self.shared_token.value, (batch_size, 1, 1))
+        init_ctx = jnp.concatenate([z_seq, z_shared], axis=1)
+        shared_kv_pos = jnp.concatenate([seq_pos, shared_pos])
+
+        z_shared = self.reason_stack(
+            z_shared,
+            context=init_ctx,
+            mask=extended_ctx_mask,
+            q_pos=shared_pos,
+            kv_pos=shared_kv_pos,
+            hyper_mods_list=hyper_mods,
+            use_cache=False,
+        )
+        
         all_time_embeds = self.time_embed(jnp.arange(max_steps))
 
         ctx = {
@@ -264,18 +279,22 @@ class UniversalReasoner(nnx.Module):
             'hyper_mods': hyper_mods,
             'reason_mask': reason_mask, 'know_mask': know_mask,
             'batch_size': batch_size,
+            'z_seq': z_seq,
         }
         return z_seq, z_shared, all_time_embeds, ctx
 
-    def _core_reasoning_step(self, curr_seq, curr_shared, t_signal, ctx):
+    def _core_reasoning_step(self, curr_seq, curr_shared, t_signal, ctx, awake_mask):
         scaled_t = t_signal[None, None, :] * 0.1
         hyper_mods = ctx['hyper_mods']
 
         shared_ctx = jnp.concatenate([curr_seq, curr_shared], axis=1)
         shared_kv_pos = jnp.concatenate([ctx['seq_pos'], ctx['shared_pos']])
 
+        reason_input = curr_shared + scaled_t
+        reason_input = curr_shared + awake_mask * (reason_input - curr_shared)
+
         new_reason_raw = self.reason_stack(
-            curr_shared + scaled_t,
+            reason_input,
             context=shared_ctx,
             mask=ctx['extended_ctx_mask'],
             q_pos=ctx['shared_pos'],
@@ -283,15 +302,22 @@ class UniversalReasoner(nnx.Module):
             hyper_mods_list=hyper_mods,
             use_cache=False,
         )
+        new_reason_raw = curr_shared + awake_mask * (new_reason_raw - curr_shared)
         shared_after_reason = new_reason_raw * ctx['reason_mask'] + curr_shared * (1.0 - ctx['reason_mask'])
 
-        know_ctx = jnp.concatenate([curr_seq, shared_after_reason], axis=1)
+        know_ctx = shared_after_reason
+
+        know_mask = jnp.ones(
+            (ctx['batch_size'], 1, SHARED_SLOTS, SHARED_SLOTS),
+            dtype=jnp.bool_
+        )
+
         new_know_raw = self.know_stack(
             shared_after_reason + scaled_t,
             context=know_ctx,
-            mask=ctx['extended_ctx_mask'],
+            mask=know_mask,
             q_pos=ctx['shared_pos'],
-            kv_pos=shared_kv_pos,
+            kv_pos=ctx['shared_pos'],
             hyper_mods_list=hyper_mods,
             use_cache=False,
         )
@@ -300,10 +326,17 @@ class UniversalReasoner(nnx.Module):
         forget = jax.nn.sigmoid(self.forget_head(new_shared))
         new_shared = forget * new_shared + (1.0 - forget) * curr_shared
 
-        latent_shift = jnp.mean(jnp.abs(new_shared - curr_shared), axis=(1, 2))
+        latent_shift = jnp.mean(
+            jnp.abs(new_shared - curr_shared) /
+            (jnp.abs(curr_shared) + 1e-6),
+            axis=(1,2)
+        )
+
         halt_pooled = self.halt_pooler(new_shared)
         halt_features = jnp.concatenate([halt_pooled, latent_shift[:, None]], axis=-1)
-        halt_prob = jax.nn.sigmoid(self.halt_head(halt_features).squeeze(-1) * HALT_TEMP)
+
+        halt_logits = self.halt_head(halt_features).squeeze(-1)
+        halt_prob = jax.nn.sigmoid(halt_logits / HALT_TEMP)
 
         return new_shared, halt_prob, forget
 
@@ -317,14 +350,24 @@ class UniversalReasoner(nnx.Module):
 
         graphdef, state = nnx.split(self)
 
-        def scan_step(carry, t_signal):
+        def scan_step(carry, inputs):
             curr_shared, p_remain_prev = carry
-
-            m = nnx.merge(graphdef, state)
-            computed_new_shared, halt_prob, forget = m._core_reasoning_step(z_seq, curr_shared, t_signal, ctx)
+            t_signal, step_id = inputs
 
             awake_mask = p_remain_prev[:, None, None]
-            new_shared = curr_shared + awake_mask * (computed_new_shared - curr_shared)
+
+            m = nnx.merge(graphdef, state)
+            computed_new_shared, halt_prob, forget = m._core_reasoning_step(z_seq, curr_shared, t_signal, ctx, awake_mask)
+
+            candidate_shared = computed_new_shared
+
+            halt_prob = jnp.where(step_id < MIN_STEPS, 0.0, halt_prob)
+
+            new_shared = jnp.where(
+                p_remain_prev[:, None, None] > 0,
+                candidate_shared,
+                curr_shared
+            )
 
             step_forget_l1 = jnp.mean(jnp.abs(forget), axis=(1, 2))
             p_remain_next = p_remain_prev * (1.0 - halt_prob)
@@ -336,8 +379,12 @@ class UniversalReasoner(nnx.Module):
 
         p_remain0 = jnp.ones((ctx['batch_size'],), dtype=z_seq.dtype)
 
+        step_ids = jnp.arange(max_steps)
+
         (final_shared, _), (all_halts, all_forget_l1) = jax.lax.scan(
-            jax.checkpoint(scan_step), (z_shared, p_remain0), all_time_embeds
+            jax.checkpoint(scan_step),
+            (z_shared, p_remain0),
+            (all_time_embeds, step_ids),
         )
 
         all_halts = jnp.clip(all_halts, 0.0, 1.0 - 1e-7)
@@ -352,7 +399,10 @@ class UniversalReasoner(nnx.Module):
         forget_loss = jnp.sum(step_weights * all_forget_l1, axis=0)
 
         shared_kv_pos = jnp.concatenate([ctx['seq_pos'], ctx['shared_pos']])
-        cross_mask = jnp.ones((ctx['batch_size'], 1, z_seq.shape[1], SHARED_SLOTS), dtype=jnp.bool_)
+        cross_mask = jnp.ones(
+            (ctx['batch_size'], 1, z_seq.shape[1], SHARED_SLOTS),
+            dtype=jnp.bool_
+        )
         extended_cross_mask = jnp.concatenate([ctx['seq_attn_mask'], cross_mask], axis=-1)
 
         final_ctx = jnp.concatenate([z_seq, final_shared], axis=1)
