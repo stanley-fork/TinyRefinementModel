@@ -9,19 +9,20 @@ import optax
 from flax import nnx
 import jax.numpy as jnp
 
-NUM_BLOCKS = 4
-LATENT_DIM = 384
+NUM_BLOCKS = 8
+LATENT_DIM = 512
 BATCH_SIZE = 1
 ACCUMULATION_STEPS = 128
 MIN_STEPS = 4
 MAX_STEPS_LIMIT = 16
-SHARED_SLOTS = 512
+SHARED_SLOTS = 256
 MAX_SEQ_LEN = 1024
 VOCAB_SIZE = 100277
 PAD_TOKEN_ID = 100257
 PONDER_LAMBDA = 1e-4
 TEMP_LAMBDA = 1e-4
 HALT_TEMP = 0.5
+CONSISTENCY_LAMBDA = 0.005
 FORGET_LAMBDA = 5e-5
 BUDGET_GATE_SHARPNESS = 10.0
 AWAKE_PROB_THRESHOLD = 1e-2
@@ -375,13 +376,13 @@ class UniversalReasoner(nnx.Module):
             rms = jnp.sqrt(jnp.mean(new_shared ** 2, axis=-1, keepdims=True) + 1e-6)
             new_shared = (new_shared / rms) * shared_norm_scale
 
-            return (new_shared, p_remain_next), (halt_prob, step_forget_l1)
+            return (new_shared, p_remain_next), (new_shared, halt_prob, step_forget_l1)
 
         p_remain0 = jnp.ones((ctx['batch_size'],), dtype=z_seq.dtype)
 
         step_ids = jnp.arange(max_steps)
 
-        (final_shared, _), (all_halts, all_forget_l1) = jax.lax.scan(
+        (final_shared, _), (all_shared, all_halts, all_forget_l1) = jax.lax.scan(
             jax.checkpoint(scan_step),
             (z_shared, p_remain0),
             (all_time_embeds, step_ids),
@@ -393,6 +394,10 @@ class UniversalReasoner(nnx.Module):
         )
         step_weights = all_halts * p_remain
         step_weights = step_weights.at[-1].add(p_remain[-1] * (1.0 - all_halts[-1]))
+
+        final_state = all_shared[-1]
+        mse_per_step = jnp.mean((all_shared - final_state[None, ...]) ** 2, axis=(2, 3))
+        consistency_loss = jnp.mean(jnp.sum(step_weights * mse_per_step, axis=0))
 
         step_indices = jnp.arange(1, max_steps + 1)[:, None]
         ponder_cost = jnp.sum(step_weights * step_indices, axis=0)
@@ -418,7 +423,7 @@ class UniversalReasoner(nnx.Module):
         z_out = self.seq_norm(z_out)
 
         logits = z_out @ self.embed.embedding.value.T
-        return logits, ponder_cost, forget_loss
+        return logits, ponder_cost, forget_loss, consistency_loss
 
 
 model = UniversalReasoner(LATENT_DIM, rngs=nnx.Rngs(0), num_blocks=NUM_BLOCKS)
@@ -439,7 +444,7 @@ def train_step(model, opt, batch_tokens, p_lambda, f_lambda):
     def loss_fn(model):
         inputs, targets = batch_tokens[:, :-1], batch_tokens[:, 1:]
 
-        preds, ponder_cost, forget_cost = model(inputs, training=True)
+        preds, ponder_cost, forget_cost, consistency_loss = model(inputs, training=True)
 
         ce_loss = optax.softmax_cross_entropy_with_integer_labels(logits=preds, labels=targets)
         token_loss = jnp.mean(ce_loss, where=(targets != PAD_TOKEN_ID))
@@ -448,6 +453,7 @@ def train_step(model, opt, batch_tokens, p_lambda, f_lambda):
             token_loss
             + p_lambda * jnp.mean(ponder_cost)
             + f_lambda * jnp.mean(forget_cost)
+            + CONSISTENCY_LAMBDA * consistency_loss
         ) / ACCUMULATION_STEPS
         return total_loss, (token_loss, jnp.mean(ponder_cost), jnp.mean(forget_cost))
 
