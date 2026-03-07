@@ -9,7 +9,7 @@ import optax
 from flax import nnx
 import jax.numpy as jnp
 
-NUM_BLOCKS = 8
+NUM_BLOCKS = 4
 LATENT_DIM = 512
 BATCH_SIZE = 1
 ACCUMULATION_STEPS = 128
@@ -19,17 +19,14 @@ SHARED_SLOTS = 512
 MAX_SEQ_LEN = 1024
 VOCAB_SIZE = 100277
 PAD_TOKEN_ID = 100257
+HALT_TEMP = 0.5
 PONDER_LAMBDA = 1e-4
 TEMP_LAMBDA = 1e-4
-HALT_TEMP = 0.5
 FORGET_LAMBDA = 5e-5
-AWAKE_PROB_THRESHOLD = 1e-2
-
 
 def rotate_half(x):
     x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
     return jnp.concatenate([-x2, x1], axis=-1)
-
 
 class RotaryAttention(nnx.Module):
     def __init__(self, num_heads, in_features, num_groups=2, rngs=None, dtype=jnp.float32):
@@ -155,7 +152,8 @@ class UniversalReasoner(nnx.Module):
 
         self.num_blocks = num_blocks
 
-        self.stack = BlockStack(num_blocks, latent_dim, num_heads=8, rngs=rngs, dtype=dtype)
+        self.enc_stack = BlockStack(num_blocks, latent_dim, num_heads=8, rngs=rngs, dtype=dtype)
+        self.reason_stack = BlockStack(num_blocks, latent_dim, num_heads=8, rngs=rngs, dtype=dtype)
 
         halt_pre_dim = latent_dim // 4
         self.halt_pre = nnx.Linear(
@@ -193,14 +191,14 @@ class UniversalReasoner(nnx.Module):
 
         z_seq = self.embed(tokens)
 
-        z_seq = self.stack(z_seq, mask=seq_attn_mask, q_pos=seq_pos, kv_pos=seq_pos)
+        z_seq = self.enc_stack(z_seq, mask=seq_attn_mask, q_pos=seq_pos, kv_pos=seq_pos)
 
         # Initialize shared memory from token context (one-time expensive step)
         z_shared = jnp.tile(self.shared_token.value, (batch_size, 1, 1))
         init_ctx = jnp.concatenate([z_seq, z_shared], axis=1)
         shared_kv_pos = jnp.concatenate([seq_pos, shared_pos])
 
-        z_shared = self.stack(
+        z_shared = self.reason_stack(
             z_shared,
             context=init_ctx,
             mask=extended_ctx_mask,
@@ -229,7 +227,7 @@ class UniversalReasoner(nnx.Module):
         stack_input = curr_shared + scaled_t
         stack_input = curr_shared + awake_mask * (stack_input - curr_shared)
 
-        new_shared_raw = self.stack(
+        new_shared_raw = self.reason_stack(
             stack_input,
             context=shared_ctx,
             mask=ctx['extended_ctx_mask'],
@@ -253,7 +251,8 @@ class UniversalReasoner(nnx.Module):
         return new_shared, halt_prob, forget
 
     def __call__(self, tokens, max_steps=MAX_STEPS_LIMIT, training=False):
-        self.stack.reset_state()
+        self.enc_stack.reset_state()
+        self.reason_stack.reset_state()
 
         z_seq, z_shared, all_time_embeds, ctx = self._prepare_reasoning_context(tokens, max_steps)
 
@@ -317,7 +316,7 @@ class UniversalReasoner(nnx.Module):
         extended_cross_mask = jnp.concatenate([ctx['seq_attn_mask'], cross_mask], axis=-1)
 
         final_ctx = jnp.concatenate([z_seq, final_shared], axis=1)
-        z_out = self.stack(
+        z_out = self.enc_stack(
             z_seq,
             context=final_ctx,
             mask=extended_cross_mask,
@@ -333,7 +332,7 @@ class UniversalReasoner(nnx.Module):
 
 model = UniversalReasoner(LATENT_DIM, rngs=nnx.Rngs(0), num_blocks=NUM_BLOCKS)
 
-schedule = optax.warmup_cosine_decay_schedule(1e-6, 1.5e-4, 200, 800, 5e-6)
+schedule = optax.warmup_cosine_decay_schedule(1e-6, 1.5e-4, 300, 600, 5e-6)
 
 base_optimizer = optax.chain(
     optax.clip_by_global_norm(1.0),
