@@ -194,34 +194,29 @@ class UniversalReasoner(nnx.Module):
         z_seq = self.enc_stack(z_seq, mask=seq_attn_mask, q_pos=seq_pos, kv_pos=seq_pos)
 
         z_shared = jnp.tile(self.shared_token.value, (batch_size, 1, 1))
-        init_ctx = jnp.concatenate([z_seq, z_shared], axis=1)
-        shared_kv_pos = jnp.concatenate([seq_pos, shared_pos])
-
-        z_shared = self.reason_stack(
-            z_shared,
-            context=init_ctx,
-            mask=extended_ctx_mask,
-            q_pos=shared_pos,
-            kv_pos=shared_kv_pos,
-            use_cache=False,
-        )
         
+        token_ctx = z_seq
+        token_pos = seq_pos
+
         all_time_embeds = self.time_embed(jnp.arange(max_steps))
 
         ctx = {
-            'seq_pos': seq_pos, 'shared_pos': shared_pos,
+            'seq_pos': seq_pos,
+            'shared_pos': shared_pos,
             'seq_attn_mask': seq_attn_mask,
             'extended_ctx_mask': extended_ctx_mask,
             'batch_size': batch_size,
             'z_seq': z_seq,
+            'token_ctx': token_ctx,
+            'token_pos': token_pos,
         }
         return z_seq, z_shared, all_time_embeds, ctx
 
     def _core_reasoning_step(self, curr_seq, curr_shared, t_signal, ctx, awake_mask):
         scaled_t = t_signal[None, None, :] * 0.1
 
-        shared_ctx = jnp.concatenate([curr_seq, curr_shared], axis=1)
-        shared_kv_pos = jnp.concatenate([ctx['seq_pos'], ctx['shared_pos']])
+        shared_ctx = jnp.concatenate([ctx['token_ctx'], curr_shared], axis=1)
+        shared_kv_pos = jnp.concatenate([ctx['token_pos'], ctx['shared_pos']])
 
         stack_input = self.time_norm(curr_shared) + scaled_t
         stack_input = curr_shared + awake_mask * (stack_input - curr_shared)

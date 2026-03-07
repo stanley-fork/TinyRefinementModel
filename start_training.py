@@ -245,20 +245,21 @@ if __name__ == "__main__":
 
             write_header = not os.path.exists(history_file) or os.path.getsize(history_file) == 0
             with open(history_file, "a", newline="") as f:
-                writer = csv.DictWriter(
-                    f, fieldnames=["step", "loss", "ce", "avg_ponder", "avg_forget_cost", "t_total"]
-                )
+                fields = ["step", "loss", "ce", "avg_ponder", "avg_forget_cost", "t_total",
+                          "logits_mean", "logits_std", "logits_min", "logits_max", "prob_mean", "prob_std"]
+                writer = csv.DictWriter(f, fieldnames=fields)
                 if write_header:
                     writer.writeheader()
-                writer.writerow(
-                    {
-                        "step": int(step),
-                        "loss": f"{step_loss:.4f}",
-                        "ce": f"{step_ce:.4f}",
-                        "avg_ponder": f"{step_p:.2f}",
-                        "avg_forget_cost": f"{step_forget_cost:.4f}",
-                        "t_total": f"{t_total:.2f}",
-                    }
-                )
+                
+                row = {
+                    "step": int(step),
+                    "loss": f"{step_loss:.4f}",
+                    "ce": f"{step_ce:.4f}",
+                    "avg_ponder": f"{step_p:.2f}",
+                    "avg_forget_cost": f"{step_forget_cost:.4f}",
+                    "t_total": f"{t_total:.2f}",
+                }
+                row.update({k: f"{v:.4f}" for k, v in step_diag.items()})
+                writer.writerow(row)
 
         step += 1

@@ -94,7 +94,8 @@ def plot_training_history(log_path="training_history.csv"):
     ax4.grid(True, linestyle='--', alpha=0.3)
     ax4.legend(loc='upper left')
     
-    for ax in [ax1, ax2, ax3, ax4]:
+    # Apply log scale only to loss plots (ax1, ax2)
+    for ax in [ax1, ax2]:
         apply_scaling(ax)
 
     ax4.set_ylim([0.9, 17.5])
@@ -207,5 +208,70 @@ def plot_training_history(log_path="training_history.csv"):
     
     print(f"\n{'='*60}")
 
+def plot_diagnostics(log_path="training_history.csv"):
+    if not os.path.exists(log_path):
+        return
+
+    history = []
+    try:
+        with open(log_path, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                # Only include rows that have diagnostic data
+                if 'logits_mean' in row and row['logits_mean']:
+                    history.append({
+                        'step': int(row['step']),
+                        'logits_mean': float(row['logits_mean']),
+                        'logits_std': float(row['logits_std']),
+                        'logits_min': float(row['logits_min']),
+                        'logits_max': float(row['logits_max']),
+                        'prob_mean': float(row['prob_mean']),
+                        'prob_std': float(row['prob_std'])
+                    })
+    except Exception as e:
+        print(f"⚠️ Error reading diagnostics from {log_path}: {e}")
+        return
+
+    if not history:
+        return
+
+    steps = np.array([entry['step'] for entry in history])
+    l_mean = np.array([entry['logits_mean'] for entry in history])
+    l_std = np.array([entry['logits_std'] for entry in history])
+    l_min = np.array([entry['logits_min'] for entry in history])
+    l_max = np.array([entry['logits_max'] for entry in history])
+    p_mean = np.array([entry['prob_mean'] for entry in history])
+    p_std = np.array([entry['prob_std'] for entry in history])
+
+    plt.style.use('dark_background')
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10), sharex=True)
+
+    # Logits Plot
+    ax1.plot(steps, l_mean, color='#00f2ff', label='Mean Logit', linewidth=2)
+    ax1.fill_between(steps, l_mean - l_std, l_mean + l_std, color='#00f2ff', alpha=0.2, label='±1σ')
+    ax1.plot(steps, l_min, color='#ff007b', linestyle='--', alpha=0.5, label='Min')
+    ax1.plot(steps, l_max, color='#adff2f', linestyle='--', alpha=0.5, label='Max')
+    ax1.set_ylabel('Logits', fontweight='bold')
+    ax1.set_title('Halt Readout Logit Diagnostics', fontsize=14, pad=10)
+    ax1.grid(True, linestyle='--', alpha=0.3)
+    ax1.legend(loc='upper right')
+
+    # Probabilities Plot
+    ax2.plot(steps, p_mean, color='#ffcc00', label='Mean Prob', linewidth=2)
+    ax2.fill_between(steps, p_mean - p_std, p_mean + p_std, color='#ffcc00', alpha=0.2, label='±1σ')
+    ax2.set_ylabel('Probability', fontweight='bold')
+    ax2.set_xlabel('Training Step', fontweight='bold')
+    ax2.set_title('Halt Probability Diagnostics', fontsize=14, pad=10)
+    ax2.set_ylim([-0.05, 1.05])
+    ax2.grid(True, linestyle='--', alpha=0.3)
+    ax2.legend(loc='upper right')
+
+    plt.tight_layout()
+    plt.savefig('halt_diagnostics.png', dpi=150, bbox_inches='tight')
+    print(f"✨ Halt diagnostics plot updated: halt_diagnostics.png")
+    plt.close()
+
 if __name__ == "__main__":
-    plot_training_history()
+    log_file = "training_history.csv"
+    plot_training_history(log_file)
+    plot_diagnostics(log_file)
