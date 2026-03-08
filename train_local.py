@@ -292,28 +292,28 @@ class UniversalReasoner(nnx.Module):
 
         shared_norm_scale = self.shared_norm.scale.value
 
-        graphdef, state = nnx.split(self)
-
         def scan_step(carry, inputs):
             curr_shared, p_remain_prev = carry
             t_signal, step_id = inputs
 
             awake_mask = p_remain_prev[:, None, None]
 
-            m = nnx.merge(graphdef, state)
-            computed_new_shared, halt_prob, forget, halt_logits, mos_aux = m._core_reasoning_step(z_seq, curr_shared, t_signal, ctx, awake_mask)
-
-            candidate_shared = computed_new_shared
+            computed_new_shared, halt_prob, forget, halt_logits, mos_aux = \
+                self._core_reasoning_step(z_seq, curr_shared, t_signal, ctx, awake_mask)
 
             halt_prob = jnp.where(step_id < MIN_STEPS, 0.0, halt_prob)
 
             new_shared = jnp.where(
                 p_remain_prev[:, None, None] > 0,
-                candidate_shared,
-                curr_shared
+                computed_new_shared,
+                curr_shared,
             )
 
-            step_forget_l1 = jnp.mean(jnp.abs(forget), axis=(1, 2)) if self.use_forget else jnp.zeros((ctx['batch_size'],))
+            step_forget_l1 = (
+                jnp.mean(jnp.abs(forget), axis=(1, 2))
+                if self.use_forget
+                else jnp.zeros((ctx['batch_size'],))
+            )
             p_remain_next = p_remain_prev * (1.0 - halt_prob)
 
             rms = jnp.sqrt(jnp.mean(new_shared ** 2, axis=-1, keepdims=True) + 1e-6)
@@ -322,7 +322,6 @@ class UniversalReasoner(nnx.Module):
             return (new_shared, p_remain_next), (new_shared, halt_prob, step_forget_l1, halt_logits, mos_aux)
 
         p_remain0 = jnp.ones((ctx['batch_size'],), dtype=z_seq.dtype)
-
         step_ids = jnp.arange(max_steps)
 
         (final_shared, _), (all_shared, all_halts_raw, all_forget_l1, all_logits, all_mos_aux) = jax.lax.scan(
@@ -414,12 +413,14 @@ def train_step(model, opt, batch_tokens, step, f_lambda):
         ce_loss = optax.softmax_cross_entropy_with_integer_labels(logits=preds, labels=targets)
         token_loss = jnp.mean(ce_loss, where=(targets != PAD_TOKEN_ID))
 
-        current_p_lambda = ponder_lambda_schedule(step)
+        mos_lb_lambda = 5e-3 if step < 500 else 1e-3 * (1 - step/1000)
+
+        current_p_lambda = 0.0 if step < 300 else ponder_lambda_schedule(step)
         total_loss = (
             token_loss
             + current_p_lambda * jnp.mean(ponder_cost)
             + f_lambda * jnp.mean(forget_cost)
-            + MOS_LB_LAMBDA * mos_lb
+            + mos_lb_lambda * mos_lb
             + MOS_ENT_LAMBDA * mos_ent
         ) / ACCUMULATION_STEPS
         return total_loss, (token_loss, jnp.mean(ponder_cost), jnp.mean(forget_cost), halt_diag)
