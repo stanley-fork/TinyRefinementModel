@@ -10,22 +10,20 @@ from flax import nnx
 import jax.numpy as jnp
 
 NUM_BLOCKS = 4
-LATENT_DIM = 384
-BATCH_SIZE = 1
-ACCUMULATION_STEPS = 128
+LATENT_DIM = 768
+BATCH_SIZE = 8
+ACCUMULATION_STEPS = 32
 MIN_STEPS = 2
 MAX_STEPS_LIMIT = 16
-SHARED_SLOTS = 256
-MAX_SEQ_LEN = 1024
+SHARED_SLOTS = 128
+MOS_TOP_K = 64
+MAX_SEQ_LEN = 512
 VOCAB_SIZE = 100277
 PAD_TOKEN_ID = 100257
-PONDER_LAMBDA = 5e-5
-TEMP_LAMBDA = 1e-4
-FORGET_LAMBDA = 3e-5
 
-MOS_TOP_K = 64
+FORGET_LAMBDA = 1e-5
 MOS_LB_LAMBDA = 1e-3
-MOS_ENT_LAMBDA = 1e-3
+MOS_ENT_LAMBDA = 1e-4
 
 def rotate_half(x):
     x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
@@ -142,7 +140,6 @@ class BlockStack(nnx.Module):
 class UniversalReasoner(nnx.Module):
     def __init__(self, latent_dim, rngs, num_blocks=NUM_BLOCKS, dtype=jnp.float32, use_forget=True):
         self.latent_dim = latent_dim
-
         self.embed = nnx.Embed(VOCAB_SIZE, latent_dim, dtype=dtype, rngs=rngs)
         self.time_embed = nnx.Embed(MAX_STEPS_LIMIT + 1, latent_dim, dtype=dtype, rngs=rngs)
 
@@ -153,207 +150,97 @@ class UniversalReasoner(nnx.Module):
         self.seq_norm = nnx.RMSNorm(latent_dim, rngs=rngs, dtype=dtype)
         self.shared_norm = nnx.RMSNorm(latent_dim, rngs=rngs, dtype=dtype)
 
-        self.num_blocks = num_blocks
-
-        self.enc_stack = BlockStack(num_blocks, latent_dim, num_heads=8, rngs=rngs, dtype=dtype)
-        self.reason_stack = BlockStack(num_blocks, latent_dim, num_heads=8, rngs=rngs, dtype=dtype)
+        self.main_stack = BlockStack(num_blocks, latent_dim, num_heads=12, rngs=rngs, dtype=dtype)
 
         halt_pre_dim = latent_dim // 4
-        self.halt_pre = nnx.Linear(
-            latent_dim, halt_pre_dim, 
-            kernel_init=nnx.initializers.variance_scaling(0.02, mode="fan_in", distribution="normal"),
-            rngs=rngs, dtype=dtype
-        )
+        self.halt_pre = nnx.Linear(latent_dim, halt_pre_dim, rngs=rngs, dtype=dtype)
         self.halt_head = nnx.Linear(halt_pre_dim, 1, dtype=jnp.float32, rngs=rngs)
-        self.halt_head.bias.value = jnp.full((1,), -1.0)
+        self.halt_head.bias.value = jnp.full((1,), 3.0) 
+        
         self.time_norm = nnx.RMSNorm(latent_dim, rngs=rngs, dtype=dtype)
 
         self.use_forget = use_forget
         if self.use_forget:
-            self.forget_head = nnx.Linear(
-                latent_dim, latent_dim,
-                bias_init=jax.nn.initializers.constant(2.0),
-                rngs=rngs, dtype=dtype,
-            )
+            self.forget_head = nnx.Linear(latent_dim, latent_dim, bias_init=jax.nn.initializers.constant(3.0), rngs=rngs, dtype=dtype)
 
         router_hidden = latent_dim // 4
         self.mos_router_pre = nnx.Linear(latent_dim, router_hidden, rngs=rngs, dtype=jnp.float32)
         self.mos_router_logit = nnx.Linear(router_hidden, 1, rngs=rngs, dtype=jnp.float32)
 
-    def _get_positions(self, seq_len):
-        seq_pos = jnp.arange(seq_len)
-        shared_pos = jnp.arange(MAX_SEQ_LEN, MAX_SEQ_LEN + SHARED_SLOTS)
-        return seq_pos, shared_pos
-
-    def _prepare_reasoning_context(self, tokens, max_steps):
+    def __call__(self, tokens, max_steps=MAX_STEPS_LIMIT, training=False):
+        self.main_stack.reset_state()
+        
+        # 1. Preparation & Encoding Pass
         batch_size, seq_len = tokens.shape
-        seq_pos, shared_pos = self._get_positions(seq_len)
-
+        seq_pos, shared_pos = jnp.arange(seq_len), jnp.arange(MAX_SEQ_LEN, MAX_SEQ_LEN + SHARED_SLOTS)
         pad_mask = tokens != PAD_TOKEN_ID
-
         causal_mask = jnp.tril(jnp.ones((seq_len, seq_len), dtype=jnp.bool_))
         seq_attn_mask = pad_mask[:, None, None, :] & causal_mask[None, None, :, :]
 
-        memory_mask = jnp.ones((batch_size, 1, 1, SHARED_SLOTS), dtype=jnp.bool_)
-        extended_ctx_mask = jnp.concatenate([pad_mask[:, None, None, :], memory_mask], axis=-1)
-
         z_seq = self.embed(tokens)
-
-        z_seq = self.enc_stack(z_seq, mask=seq_attn_mask, q_pos=seq_pos, kv_pos=seq_pos)
+        # USE MAIN_STACK FOR INITIAL ENCODING
+        z_seq = self.main_stack(z_seq, mask=seq_attn_mask, q_pos=seq_pos, kv_pos=seq_pos)
 
         z_shared = jnp.tile(self.shared_token.value, (batch_size, 1, 1))
-        
-        token_ctx = z_seq
-        token_pos = seq_pos
-
         all_time_embeds = self.time_embed(jnp.arange(max_steps))
+        
+        extended_ctx_mask = jnp.concatenate([pad_mask[:, None, None, :], jnp.ones((batch_size, 1, 1, SHARED_SLOTS), dtype=jnp.bool_)], axis=-1)
 
-        ctx = {
-            'seq_pos': seq_pos,
-            'shared_pos': shared_pos,
-            'seq_attn_mask': seq_attn_mask,
-            'extended_ctx_mask': extended_ctx_mask,
-            'batch_size': batch_size,
-            'z_seq': z_seq,
-            'token_ctx': token_ctx,
-            'token_pos': token_pos,
-        }
-        return z_seq, z_shared, all_time_embeds, ctx
-
-    def _core_reasoning_step(self, curr_seq, curr_shared, t_signal, ctx, awake_mask):
-        scaled_t = t_signal[None, None, :] * 0.1
-
-        shared_ctx = jnp.concatenate([ctx['token_ctx'], curr_shared], axis=1)
-        shared_kv_pos = jnp.concatenate([ctx['token_pos'], ctx['shared_pos']])
-
-        stack_input = self.time_norm(curr_shared) + scaled_t
-        stack_input = curr_shared + awake_mask * (stack_input - curr_shared)
-
-        new_shared_raw = self.reason_stack(
-            stack_input,
-            context=shared_ctx,
-            mask=ctx['extended_ctx_mask'],
-            q_pos=ctx['shared_pos'],
-            kv_pos=shared_kv_pos,
-            use_cache=False,
-        )
-
-        router_hidden = jax.nn.gelu(self.mos_router_pre(new_shared_raw))
-
-        router_logits = self.mos_router_logit(router_hidden).squeeze(-1)
-        router_logits = router_logits / 2.0
-
-        router_probs = jax.nn.sigmoid(router_logits)
-
-        _, topk_indices = jax.lax.top_k(router_logits, k=MOS_TOP_K)
-        hard_mask = jax.nn.one_hot(topk_indices, SHARED_SLOTS, dtype=router_logits.dtype).sum(axis=1)
-
-        mos_gate = hard_mask + router_probs - jax.lax.stop_gradient(router_probs)
-
-        mos_gate_expanded = mos_gate[..., None]
-        new_shared = (
-            mos_gate_expanded * new_shared_raw
-            + (1.0 - mos_gate_expanded) * curr_shared
-        )
-
-        new_shared = curr_shared + awake_mask * (new_shared - curr_shared)
-
-        if self.use_forget:
-            forget = jax.nn.sigmoid(self.forget_head(new_shared))
-            new_shared = forget * new_shared + (1.0 - forget) * curr_shared
-        else:
-            forget = jnp.ones_like(new_shared)
-
-        target_usage = MOS_TOP_K / SHARED_SLOTS
-        mean_slot_probs = jnp.mean(router_probs, axis=0)
-        load_balance_loss = jnp.mean((mean_slot_probs - target_usage) ** 2)
-
-        slot_entropy = - (
-            router_probs * jnp.log(router_probs + 1e-9) + 
-            (1.0 - router_probs) * jnp.log(1.0 - router_probs + 1e-9)
-        )
-        entropy_loss = jnp.mean(slot_entropy)
-
-        mos_aux = {
-            'load_balance': load_balance_loss,
-            'entropy': entropy_loss,
-            'mean_slots_active': jnp.mean(jnp.sum(hard_mask, axis=-1)),
-        }
-
-        pooled = jnp.mean(new_shared, axis=1)
-        pre = jax.nn.gelu(self.halt_pre(pooled))
-        halt_logits = self.halt_head(pre).squeeze(-1)
-        halt_prob = jax.nn.sigmoid(halt_logits)
-
-        return new_shared, halt_prob, forget, halt_logits, mos_aux
-
-    def __call__(self, tokens, max_steps=MAX_STEPS_LIMIT, training=False):
-        self.enc_stack.reset_state()
-        self.reason_stack.reset_state()
-
-        z_seq, z_shared, all_time_embeds, ctx = self._prepare_reasoning_context(tokens, max_steps)
-
-        shared_norm_scale = self.shared_norm.scale.value
-
+        # 2. Reasoning Loop (Scan)
         def scan_step(carry, inputs):
             curr_shared, p_remain_prev = carry
             t_signal, step_id = inputs
+            
+            shared_ctx = jnp.concatenate([z_seq, curr_shared], axis=1)
+            shared_kv_pos = jnp.concatenate([seq_pos, shared_pos])
 
-            awake_mask = p_remain_prev[:, None, None]
+            # Apply Time Signal
+            stack_input = self.time_norm(curr_shared) + (t_signal[None, None, :] * 0.1)
+            
+            # CORE RECURSION: Using the same main_stack
+            new_shared_raw = self.main_stack(
+                stack_input, context=shared_ctx, mask=extended_ctx_mask,
+                q_pos=shared_pos, kv_pos=shared_kv_pos
+            )
 
-            computed_new_shared, halt_prob, forget, halt_logits, mos_aux = \
-                self._core_reasoning_step(z_seq, curr_shared, t_signal, ctx, awake_mask)
+            # MoS Routing
+            router_logits = self.mos_router_logit(jax.nn.gelu(self.mos_router_pre(new_shared_raw))).squeeze(-1)
+            router_probs = jax.nn.sigmoid(router_logits / 2.0)
+            _, topk_indices = jax.lax.top_k(router_logits, k=MOS_TOP_K)
+            hard_mask = jax.nn.one_hot(topk_indices, SHARED_SLOTS, dtype=router_logits.dtype).sum(axis=1)
+            mos_gate = (hard_mask + router_probs - jax.lax.stop_gradient(router_probs))[..., None]
+            
+            new_shared = (mos_gate * new_shared_raw + (1.0 - mos_gate) * curr_shared)
+            
+            if self.use_forget:
+                forget = jax.nn.sigmoid(self.forget_head(new_shared))
+                new_shared = forget * new_shared + (1.0 - forget) * curr_shared
+                forget_val = jnp.mean(jnp.abs(forget))
+            else:
+                forget_val = 0.0
 
+            # MoS Metrics for Return
+            target_usage = MOS_TOP_K / SHARED_SLOTS
+            mean_slot_probs = jnp.mean(router_probs, axis=0)
+            lb_loss = jnp.mean((mean_slot_probs - target_usage) ** 2)
+            slot_entropy = - (router_probs * jnp.log(router_probs + 1e-9) + (1.0 - router_probs) * jnp.log(1.0 - router_probs + 1e-9))
+            ent_loss = jnp.mean(slot_entropy)
+            
+            # Halt Logic
+            halt_prob = jax.nn.sigmoid(self.halt_head(jax.nn.gelu(self.halt_pre(jnp.mean(new_shared, axis=1))))).squeeze(-1)
             halt_prob = jnp.where(step_id < MIN_STEPS, 0.0, halt_prob)
-
-            new_shared = jnp.where(
-                p_remain_prev[:, None, None] > 0,
-                computed_new_shared,
-                curr_shared,
-            )
-
-            step_forget_l1 = (
-                jnp.mean(jnp.abs(forget), axis=(1, 2))
-                if self.use_forget
-                else jnp.zeros((ctx['batch_size'],))
-            )
+            
             p_remain_next = p_remain_prev * (1.0 - halt_prob)
+            return (new_shared, p_remain_next), (new_shared, halt_prob, forget_val, lb_loss, ent_loss, jnp.sum(hard_mask, axis=-1))
 
-            rms = jnp.sqrt(jnp.mean(new_shared ** 2, axis=-1, keepdims=True) + 1e-6)
-            new_shared = (new_shared / rms) * shared_norm_scale
-            # Hard NaN guard: if any NaN enters the carry, fall back to curr_shared
-            new_shared = jnp.where(jnp.isnan(new_shared), curr_shared, new_shared)
-            p_remain_next = jnp.where(jnp.isnan(p_remain_next), p_remain_prev, p_remain_next)
-
-            return (new_shared, p_remain_next), (new_shared, halt_prob, step_forget_l1, halt_logits, mos_aux)
-
-        p_remain0 = jnp.ones((ctx['batch_size'],), dtype=z_seq.dtype)
-        step_ids = jnp.arange(max_steps)
-
-        (final_shared, _), (all_shared, all_halts_raw, all_forget_l1, all_logits, all_mos_aux) = jax.lax.scan(
-            jax.checkpoint(scan_step),
-            (z_shared, p_remain0),
-            (all_time_embeds, step_ids),
+        (final_shared, _), (all_shared, all_halts, all_forget_l1, all_lb, all_ent, all_active) = jax.lax.scan(
+            jax.checkpoint(scan_step), (z_shared, jnp.ones((batch_size,))), (all_time_embeds, jnp.arange(max_steps))
         )
 
-        mos_lb_loss = jnp.mean(all_mos_aux['load_balance'])
-        mos_ent_loss = jnp.mean(all_mos_aux['entropy'])
-
-        halt_diag = {
-            'logits_mean': jnp.mean(all_logits),
-            'logits_std': jnp.std(all_logits),
-            'logits_min': jnp.min(all_logits),
-            'logits_max': jnp.max(all_logits),
-            'prob_mean': jnp.mean(all_halts_raw),
-            'prob_std': jnp.std(all_halts_raw),
-            'mos_slots_active': jnp.mean(all_mos_aux['mean_slots_active']),
-            'mos_lb_loss': mos_lb_loss,
-            'mos_ent_loss': mos_ent_loss,
-        }
-
-        all_halts = jnp.clip(all_halts_raw, 0.0, 1.0 - 1e-7)
+        # 3. Final Prediction
+        all_halts = jnp.clip(all_halts, 0.0, 1.0 - 1e-7)
         p_remain = jnp.concatenate(
-            [jnp.ones((1, ctx['batch_size'])), jnp.cumprod(1.0 - all_halts, axis=0)[:-1]], axis=0
+            [jnp.ones((1, batch_size)), jnp.cumprod(1.0 - all_halts, axis=0)[:-1]], axis=0
         )
         step_weights = all_halts * p_remain
         step_weights = step_weights.at[-1].add(p_remain[-1] * (1.0 - all_halts[-1]))
@@ -364,40 +251,35 @@ class UniversalReasoner(nnx.Module):
         step_indices = jnp.arange(1, max_steps + 1)[:, None]
         ponder_cost = jnp.sum(step_weights * step_indices, axis=0)
         forget_loss = jnp.sum(step_weights * all_forget_l1, axis=0)
-
-        shared_kv_pos = jnp.concatenate([ctx['seq_pos'], ctx['shared_pos']])
-        cross_mask = jnp.ones(
-            (ctx['batch_size'], 1, z_seq.shape[1], SHARED_SLOTS),
-            dtype=jnp.bool_
-        )
-        extended_cross_mask = jnp.concatenate([ctx['seq_attn_mask'], cross_mask], axis=-1)
-
-        final_ctx = jnp.concatenate([z_seq, expected_shared], axis=1)
-        z_out = self.enc_stack(
-            z_seq,
-            context=final_ctx,
-            mask=extended_cross_mask,
-            q_pos=ctx['seq_pos'],
-            kv_pos=shared_kv_pos,
-            use_cache=False,
-        )
-        z_out = self.seq_norm(z_out)
-
-        logits = z_out @ self.embed.embedding.value.T
+        
+        mos_lb_loss = jnp.mean(all_lb)
+        mos_ent_loss = jnp.mean(all_ent)
+        
+        halt_diag = {
+            'prob_mean': jnp.mean(all_halts),
+            'mos_slots_active': jnp.mean(all_active),
+            'mos_lb_loss': mos_lb_loss,
+            'mos_ent_loss': mos_ent_loss,
+        }
+        
+        # FINAL DECODING Pass (Again using main_stack)
+        z_out = self.main_stack(z_seq, context=jnp.concatenate([z_seq, expected_shared], axis=1), 
+                               mask=extended_ctx_mask, q_pos=seq_pos, kv_pos=jnp.concatenate([seq_pos, shared_pos]))
+        
+        logits = self.seq_norm(z_out) @ self.embed.embedding.value.T
         return logits, ponder_cost, forget_loss, halt_diag, mos_lb_loss, mos_ent_loss
 
 
 model = UniversalReasoner(LATENT_DIM, rngs=nnx.Rngs(0), num_blocks=NUM_BLOCKS)
 
-schedule = optax.warmup_cosine_decay_schedule(1e-6, 1.5e-4, 300, 600, 5e-6)
+schedule = optax.warmup_cosine_decay_schedule(1e-6, 4e-4, 300, 600, 5e-6)
 
 ponder_lambda_schedule = optax.warmup_cosine_decay_schedule(
     init_value = 0.0,
-    peak_value = 5e-4,
-    warmup_steps = 200,
-    decay_steps = 500,
-    end_value = 1.5e-4,
-    exponent = 1.0,
+    peak_value = 0.0,
+    warmup_steps = 1500,
+    decay_steps = 3500,
+    end_value = 2e-4,
 )
 
 base_optimizer = optax.chain(
@@ -418,20 +300,19 @@ def train_step(model, opt, batch_tokens, step, f_lambda):
 
         ce_loss = optax.softmax_cross_entropy_with_integer_labels(logits=preds, labels=targets)
         non_pad_mask = (targets != PAD_TOKEN_ID)
-        num_valid = jnp.sum(non_pad_mask).clip(min=1)  # guard against all-padding batch
+        num_valid = jnp.sum(non_pad_mask).clip(min=1)
         token_loss = jnp.sum(ce_loss * non_pad_mask) / num_valid
 
-        mos_lb_lambda = jnp.where(step < 500, 5e-3, jnp.clip(1e-3 * (1 - step / 1000), 0.0, None))
-        current_p_lambda = jnp.where(step < 300, 0.0, ponder_lambda_schedule(step))
+        current_p_lambda = ponder_lambda_schedule(step)
 
         total_loss = (
             token_loss
             + current_p_lambda * jnp.mean(ponder_cost)
             + f_lambda * jnp.mean(forget_cost)
-            + mos_lb_lambda * mos_lb
+            + MOS_LB_LAMBDA * mos_lb
             + MOS_ENT_LAMBDA * mos_ent
         ) / ACCUMULATION_STEPS
-        # Prevent NaN/Inf from corrupting weights — skip bad batch by zeroing the loss
+        
         total_loss = jnp.where(jnp.isfinite(total_loss), total_loss, 0.0)
         return total_loss, (token_loss, jnp.mean(ponder_cost), jnp.mean(forget_cost), halt_diag)
 
