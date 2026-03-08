@@ -416,7 +416,6 @@ def train_step(model, opt, batch_tokens, step, f_lambda):
         mos_lb_lambda = jnp.where(step < 500, 5e-3, 1e-3 * (1 - step / 1000))
         current_p_lambda = jnp.where(step < 300, 0.0, ponder_lambda_schedule(step))
 
-        current_p_lambda = 0.0 if step < 300 else ponder_lambda_schedule(step)
         total_loss = (
             token_loss
             + current_p_lambda * jnp.mean(ponder_cost)
