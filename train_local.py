@@ -215,7 +215,7 @@ class UniversalReasoner(nnx.Module):
             if self.use_forget:
                 forget = jax.nn.sigmoid(self.forget_head(new_shared))
                 new_shared = forget * new_shared + (1.0 - forget) * curr_shared
-                forget_val = jnp.mean(jnp.abs(forget))
+                forget_val = jnp.mean(jnp.abs(forget), axis=(1, 2))
             else:
                 forget_val = 0.0
 
