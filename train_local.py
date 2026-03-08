@@ -269,7 +269,7 @@ class UniversalReasoner(nnx.Module):
             router_probs * jnp.log(router_probs + 1e-9) + 
             (1.0 - router_probs) * jnp.log(1.0 - router_probs + 1e-9)
         )
-        entropy_loss = -jnp.mean(slot_entropy)
+        entropy_loss = jnp.mean(slot_entropy)
 
         mos_aux = {
             'load_balance': load_balance_loss,
@@ -413,7 +413,8 @@ def train_step(model, opt, batch_tokens, step, f_lambda):
         ce_loss = optax.softmax_cross_entropy_with_integer_labels(logits=preds, labels=targets)
         token_loss = jnp.mean(ce_loss, where=(targets != PAD_TOKEN_ID))
 
-        mos_lb_lambda = 5e-3 if step < 500 else 1e-3 * (1 - step/1000)
+        mos_lb_lambda = jnp.where(step < 500, 5e-3, 1e-3 * (1 - step / 1000))
+        current_p_lambda = jnp.where(step < 300, 0.0, ponder_lambda_schedule(step))
 
         current_p_lambda = 0.0 if step < 300 else ponder_lambda_schedule(step)
         total_loss = (
