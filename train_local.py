@@ -151,7 +151,7 @@ class UniversalReasoner(nnx.Module):
         halt_pre_dim = latent_dim // 4
         self.halt_pre = nnx.Linear(latent_dim, halt_pre_dim, rngs=rngs, dtype=dtype)
         self.halt_head = nnx.Linear(halt_pre_dim, 1, dtype=jnp.float32, rngs=rngs)
-        self.halt_head.bias.value = jnp.full((1,), 5.0) 
+        self.halt_head.bias.value = jnp.full((1,), -1.0) 
         
         self.time_norm = nnx.RMSNorm(latent_dim, rngs=rngs, dtype=dtype)
 
@@ -270,7 +270,7 @@ class UniversalReasoner(nnx.Module):
         )
         
         logits = self.seq_norm(z_out) @ self.embed.embedding.value.T
-        return logits, ponder_cost, forget_loss, halt_diag
+        return logits, ponder_cost, forget_loss, halt_diag, expected_shared
 
 
 
@@ -295,12 +295,21 @@ optimizer_chain = optax.MultiSteps(base_optimizer, every_k_schedule=ACCUMULATION
 optimizer = nnx.Optimizer(model, optimizer_chain, wrt=nnx.Param)
 
 
+def calculate_diversity_loss(expected_shared):
+    normed = expected_shared / (jnp.linalg.norm(expected_shared, axis=-1, keepdims=True) + 1e-8)
+    similarity = jnp.einsum('bsd,btd->bst', normed, normed)
+    identity = jnp.eye(SHARED_SLOTS)[None, :, :]
+    off_diagonal_sim = jnp.abs(similarity - identity)
+    return jnp.mean(off_diagonal_sim)
+
+
 @nnx.jit
 def train_step(model, opt, batch_tokens, step, f_lambda):
     def loss_fn(model):
         inputs, targets = batch_tokens[:, :-1], batch_tokens[:, 1:]
 
-        preds, ponder_cost, forget_cost, halt_diag = model(inputs, training=True)
+        preds, ponder_cost, forget_cost, halt_diag, expected_shared = model(inputs, training=True)
+        div_loss = calculate_diversity_loss(expected_shared)
 
 
         ce_loss = optax.softmax_cross_entropy_with_integer_labels(logits=preds, labels=targets)
@@ -314,9 +323,13 @@ def train_step(model, opt, batch_tokens, step, f_lambda):
             token_loss
             + current_p_lambda * jnp.mean(ponder_cost)
             + f_lambda * jnp.mean(forget_cost)
+            + 0.01 * div_loss
         ) / ACCUMULATION_STEPS
         
         total_loss = jnp.where(jnp.isfinite(total_loss), total_loss, 0.0)
+        
+        halt_diag['diversity_loss'] = div_loss
+        
         return total_loss, (token_loss, jnp.mean(ponder_cost), jnp.mean(forget_cost), halt_diag)
 
     (loss, aux), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
