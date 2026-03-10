@@ -163,7 +163,6 @@ class UniversalReasoner(nnx.Module):
     def __call__(self, tokens, max_steps=MAX_STEPS_LIMIT, training=False):
         self.main_stack.reset_state()
         
-        # 1. Preparation & Encoding Pass
         batch_size, seq_len = tokens.shape
         seq_pos, shared_pos = jnp.arange(seq_len), jnp.arange(MAX_SEQ_LEN, MAX_SEQ_LEN + SHARED_SLOTS)
         pad_mask = tokens != PAD_TOKEN_ID
@@ -171,7 +170,6 @@ class UniversalReasoner(nnx.Module):
         seq_attn_mask = pad_mask[:, None, None, :] & causal_mask[None, None, :, :]
 
         z_seq = self.embed(tokens)
-        # USE MAIN_STACK FOR INITIAL ENCODING
         z_seq = self.main_stack(z_seq, mask=seq_attn_mask, q_pos=seq_pos, kv_pos=seq_pos)
 
         z_shared = jnp.tile(self.shared_token.value, (batch_size, 1, 1))
@@ -179,7 +177,6 @@ class UniversalReasoner(nnx.Module):
         
         extended_ctx_mask = jnp.concatenate([pad_mask[:, None, None, :], jnp.ones((batch_size, 1, 1, SHARED_SLOTS), dtype=jnp.bool_)], axis=-1)
 
-        # 2. Reasoning Loop (Scan)
         def scan_step(carry, inputs):
             curr_shared, p_remain_prev = carry
             t_signal, step_id = inputs
@@ -201,7 +198,6 @@ class UniversalReasoner(nnx.Module):
             else:
                 forget_val = 0.0
             
-            # Halt Logic
             pooled = jnp.mean(new_shared, axis=1)
             halt_logits = self.halt_head(jax.nn.gelu(self.halt_pre(pooled))).squeeze(-1)
             halt_prob = jax.nn.sigmoid(halt_logits)
@@ -215,31 +211,24 @@ class UniversalReasoner(nnx.Module):
         )
 
 
-        # --- 3. Final Prediction (Optimized & Shape-Fixed) ---
         all_halts = jnp.clip(all_halts, 0.0, 1.0 - 1e-7)
         
-        # Ensure p_remain is (Steps, Batch)
         p_remain = jnp.concatenate(
             [jnp.ones((1, batch_size)), jnp.cumprod(1.0 - all_halts, axis=0)[:-1]], axis=0
         )
         
-        # Weights for each step: (16, 8)
         step_weights = all_halts * p_remain
-        # Add the remaining probability to the last step
         last_step_extra = p_remain[-1] * (1.0 - all_halts[-1])
         step_weights = step_weights.at[-1].add(last_step_extra)
 
-        # For expected_shared: (16, 8, 128, 768)
         weights_for_shared = step_weights[:, :, None, None]
         expected_shared = jnp.sum(weights_for_shared * all_shared, axis=0)
 
-        # Shape fix for broadcasting (16, 1) against (16, 8)
         step_indices = jnp.arange(1, max_steps + 1)[:, None]
         
         ponder_cost = jnp.sum(step_weights * jnp.maximum(0, step_indices - MIN_STEPS), axis=0)
         forget_loss = jnp.sum(step_weights * all_forget_l1, axis=0)
         
-        # Advanced Diagnostics
         flat_shared = expected_shared.reshape(-1, self.latent_dim)
         slot_corr = jnp.corrcoef(flat_shared)
         saturation_score = jnp.mean(jnp.abs(slot_corr))

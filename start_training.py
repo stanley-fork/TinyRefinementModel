@@ -9,6 +9,7 @@ import os
 import threading
 import queue
 import multiprocessing as mp
+from functools import partial
 from dotenv import load_dotenv
 from datasets import load_dataset
 from train_local import (
@@ -18,37 +19,35 @@ from train_local import (
     LATENT_DIM, MAX_SEQ_LEN, BATCH_SIZE, ACCUMULATION_STEPS, PAD_TOKEN_ID, FORGET_LAMBDA
 )
 
-load_dotenv()
+if __name__ == "__main__":
+    try:
+        mp.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass
 
-if "HF_HUB_ENABLE_HF_TRANSFER" not in os.environ:
-    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+load_dotenv()
 
 CHECKPOINT_INTERVAL = 10
 SORT_BUFFER_SIZE = 10_000
 PREFETCH_SIZE = 16
 
-
-def start_prefetch_worker(data_gen, batch_size, q):
-    def worker():
-        while True:
-            batch = data_gen.get_batch(batch_size)
-            if batch is None:
-                q.put(None)
-                return
-            q.put(batch)
-
-    t = threading.Thread(target=worker, daemon=True)
-    t.start()
-    return t
-
+def global_tokenize_item(text, max_seq_len, enc_name):
+    import tiktoken
+    enc = tiktoken.get_encoding(enc_name)
+    tokens = enc.encode(text)
+    if len(tokens) < max_seq_len:
+        tokens = tokens + [PAD_TOKEN_ID] * (max_seq_len - len(tokens))
+    else:
+        tokens = tokens[: max_seq_len]
+    return tokens
 
 class TextDataGenerator:
     def __init__(self, max_seq_len=MAX_SEQ_LEN):
         self.max_seq_len = max_seq_len
-        self.enc = tiktoken.get_encoding("cl100k_base")
-
+        self.enc_name = "cl100k_base"
+        
         token = os.environ.get("HF_TOKEN")
-        print(f"🚀 Preparing FineWeb-Edu (sorted by difficulty) (Auth: {'Yes' if token else 'No'})...")
+        print(f"🚀 Preparing FineWeb-Edu (sorted by difficulty)...")
 
         ds = load_dataset(
             "HuggingFaceFW/fineweb-edu",
@@ -74,18 +73,8 @@ class TextDataGenerator:
             buffer.sort(key=lambda x: x["score"])
             yield from buffer
 
-    def _tokenize_item(self, text):
-        tokens = self.enc.encode(text)
-        if len(tokens) < self.max_seq_len:
-            tokens = tokens + [PAD_TOKEN_ID] * (self.max_seq_len - len(tokens))
-        else:
-            tokens = tokens[: self.max_seq_len]
-        return tokens
-
     def get_batch(self, batch_size):
-        if self.exhausted:
-            return None
-            
+        if self.exhausted: return None
         batch_texts = []
         while len(batch_texts) < batch_size:
             try:
@@ -94,49 +83,49 @@ class TextDataGenerator:
             except StopIteration:
                 self.exhausted = True
                 break
-            except Exception:
-                continue
         
-        if not batch_texts:
-            return None
+        if not batch_texts: return None
             
-        batch_ids = self.pool.map(self._tokenize_item, batch_texts)
-            
+        tokenize_func = partial(global_tokenize_item, 
+                                max_seq_len=self.max_seq_len, 
+                                enc_name=self.enc_name)
+        
+        batch_ids = self.pool.map(tokenize_func, batch_texts)
         return jnp.array(batch_ids, dtype=jnp.int32)
 
+def start_prefetch_worker(data_gen, batch_size, q):
+    def worker():
+        while True:
+            batch = data_gen.get_batch(batch_size)
+            if batch is None:
+                q.put(None)
+                return
+            q.put(batch)
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    return t
 
 class LossMonitor:
-    def __init__(self, patience=500, window=500, max_ponder_limit=16):
+    def __init__(self, patience=500, window=500):
         self.patience = patience
         self.window = window
-        self.max_ponder_limit = max_ponder_limit
-
         self.ce_history = []
         self.best_ce = float("inf")
         self.last_improvement_step = 0
 
-    def push(self, step, ce_loss, avg_ponder):
+    def push(self, step, ce_loss):
         self.ce_history.append(ce_loss)
-        if len(self.ce_history) > self.window:
-            self.ce_history.pop(0)
-
+        if len(self.ce_history) > self.window: self.ce_history.pop(0)
         avg_ce = sum(self.ce_history) / len(self.ce_history)
-
         if avg_ce < (self.best_ce - 0.01):
             self.best_ce = avg_ce
             self.last_improvement_step = step
             return False
-
-        if (step - self.last_improvement_step) > self.patience:
-            print(f"\n🛑 Plateau detected: No CE improvement > 0.01 for {self.patience} steps.")
-            return True
-
-        return False
-
+        return (step - self.last_improvement_step) > self.patience
 
 if __name__ == "__main__":
     print(f"🚀 Initializing Dynamic Latent Reasoner (Dim={LATENT_DIM})...")
-    model = UniversalReasoner(LATENT_DIM, nnx.Rngs(42), dtype=jnp.float32)
+    model = UniversalReasoner(LATENT_DIM, nnx.Rngs(42))
     optimizer = nnx.Optimizer(model, optimizer_chain, wrt=nnx.Param)
 
     data_gen = TextDataGenerator(MAX_SEQ_LEN)
@@ -214,7 +203,6 @@ if __name__ == "__main__":
         if batch is None:
             break
 
-        # Single sync point for the whole macro-step
         if last_loss is not None:
             last_loss.block_until_ready()
 
