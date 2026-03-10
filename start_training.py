@@ -176,7 +176,11 @@ if __name__ == "__main__":
         t0 = time.time()
         # Accumulate as JAX arrays — no float() sync inside the loop
         step_loss = step_ce = step_p = step_forget_cost = 0.0
-        step_diag = {k: 0.0 for k in ['logits_mean', 'logits_std', 'logits_min', 'logits_max', 'prob_mean', 'prob_std']}
+        step_diag = {k: 0.0 for k in [
+            'logits_mean', 'logits_std', 'logits_min', 'logits_max', 
+            'prob_mean', 'prob_std', 'saturation', 'temporal_drift', 
+            'forget_density', 'logit_spread'
+        ]}
 
         last_loss = None
         batch = None
@@ -238,15 +242,17 @@ if __name__ == "__main__":
             print(
                 f"Step {step:04d} | CE: {step_ce:.4f} | Agg Loss: {step_loss:.4f} | "
                 f"Avg Steps: {step_p:.2f} | Forget: {step_forget_cost:.4f} | Time: {t_total:.2f}s\n"
-                f"      Logits [μ:{step_diag['logits_mean']:.2f}, σ:{step_diag['logits_std']:.2f}, min:{step_diag['logits_min']:.2f}, max:{step_diag['logits_max']:.2f}] | "
-                f"Prob [μ:{step_diag['prob_mean']:.3f}, σ:{step_diag['prob_std']:.3f}]\n"
-
+                f"      Logits [μ:{step_diag['logits_mean']:.2f}, σ:{step_diag['logits_std']:.2f}] | Spread: {step_diag['logit_spread']:.2f} | "
+                f"Sat: {step_diag['saturation']:.3f} | Drift: {step_diag['temporal_drift']:.3f} | Forget: {step_diag['forget_density']:.3f}\n"
             )
 
             write_header = not os.path.exists(history_file) or os.path.getsize(history_file) == 0
             with open(history_file, "a", newline="") as f:
-                fields = ["step", "loss", "ce", "avg_ponder", "avg_forget_cost", "t_total",
-                          "logits_mean", "logits_std", "logits_min", "logits_max", "prob_mean", "prob_std"]
+                fields = [
+                    "step", "loss", "ce", "avg_ponder", "avg_forget_cost", "t_total",
+                    "logits_mean", "logits_std", "saturation", "temporal_drift", 
+                    "forget_density", "logit_spread"
+                ]
 
                 writer = csv.DictWriter(f, fieldnames=fields)
                 if write_header:
@@ -260,7 +266,7 @@ if __name__ == "__main__":
                     "avg_forget_cost": f"{step_forget_cost:.4f}",
                     "t_total": f"{t_total:.2f}",
                 }
-                row.update({k: f"{v:.4f}" for k, v in step_diag.items()})
+                row.update({k: f"{v:.4f}" for k, v in step_diag.items() if k in fields})
                 writer.writerow(row)
 
         step += 1

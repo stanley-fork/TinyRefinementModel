@@ -14,7 +14,7 @@ LATENT_DIM = 768
 BATCH_SIZE = 2
 ACCUMULATION_STEPS = 128 
 MIN_STEPS = 4
-MAX_STEPS_LIMIT = 32
+MAX_STEPS_LIMIT = 16
 SHARED_SLOTS = 64
 MAX_SEQ_LEN = 512
 VOCAB_SIZE = 100277
@@ -239,6 +239,15 @@ class UniversalReasoner(nnx.Module):
         ponder_cost = jnp.sum(step_weights * step_indices, axis=0)
         forget_loss = jnp.sum(step_weights * all_forget_l1, axis=0)
         
+        # Advanced Diagnostics
+        flat_shared = expected_shared.reshape(-1, self.latent_dim)
+        slot_corr = jnp.corrcoef(flat_shared)
+        saturation_score = jnp.mean(jnp.abs(slot_corr))
+
+        drift = jnp.linalg.norm(all_shared[-1] - all_shared[0]) / (jnp.linalg.norm(all_shared[0]) + 1e-7)
+        forget_density = jnp.mean(all_forget_l1)
+        logit_spread = jnp.max(all_logits) - jnp.min(all_logits)
+
         halt_diag = {
             'logits_mean': jnp.mean(all_logits),
             'logits_std': jnp.std(all_logits),
@@ -246,6 +255,10 @@ class UniversalReasoner(nnx.Module):
             'logits_max': jnp.max(all_logits),
             'prob_mean': jnp.mean(all_halts),
             'prob_std': jnp.std(all_halts),
+            'saturation': saturation_score,
+            'temporal_drift': drift,
+            'forget_density': forget_density,
+            'logit_spread': logit_spread,
         }
 
         z_out = self.main_stack(
