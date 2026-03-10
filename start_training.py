@@ -19,11 +19,7 @@ from train_local import (
     LATENT_DIM, MAX_SEQ_LEN, BATCH_SIZE, ACCUMULATION_STEPS, PAD_TOKEN_ID, FORGET_LAMBDA
 )
 
-if __name__ == "__main__":
-    try:
-        mp.set_start_method('spawn', force=True)
-    except RuntimeError:
-        pass
+
 
 load_dotenv()
 
@@ -124,6 +120,11 @@ class LossMonitor:
         return (step - self.last_improvement_step) > self.patience
 
 if __name__ == "__main__":
+    try:
+        mp.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass
+
     print(f"🚀 Initializing Dynamic Latent Reasoner (Dim={LATENT_DIM})...")
     model = UniversalReasoner(LATENT_DIM, nnx.Rngs(42))
     optimizer = nnx.Optimizer(model, optimizer_chain, wrt=nnx.Param)
@@ -214,7 +215,8 @@ if __name__ == "__main__":
 
         t_total = time.time() - t0
 
-        if monitor.push(step, step_ce, step_p):
+        if monitor.push(step, step_ce): 
+            print("🛑 Training halted: No improvement in CE.")
             break
 
         if step % CHECKPOINT_INTERVAL == 0:

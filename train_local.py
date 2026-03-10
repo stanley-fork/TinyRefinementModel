@@ -263,25 +263,16 @@ class UniversalReasoner(nnx.Module):
 
 
 
-model = UniversalReasoner(LATENT_DIM, rngs=nnx.Rngs(0), num_blocks=NUM_BLOCKS)
-
 schedule = optax.warmup_cosine_decay_schedule(1e-6, 4e-4, 600, 1200, 5e-6)
-
 ponder_lambda_schedule = optax.warmup_cosine_decay_schedule(
-    init_value = 0.0,
-    peak_value = 0.0,
-    warmup_steps = 600,
-    decay_steps = 1200,
-    end_value = 2e-4,
+    init_value = 0.0, peak_value = 0.0, warmup_steps = 600, 
+    decay_steps = 1200, end_value = 2e-4
 )
-
 base_optimizer = optax.chain(
     optax.clip_by_global_norm(1.0),
     optax.adafactor(learning_rate=schedule, multiply_by_parameter_scale=True),
 )
-
 optimizer_chain = optax.MultiSteps(base_optimizer, every_k_schedule=ACCUMULATION_STEPS)
-optimizer = nnx.Optimizer(model, optimizer_chain, wrt=nnx.Param)
 
 
 def calculate_diversity_loss(expected_shared):
