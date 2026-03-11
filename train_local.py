@@ -10,11 +10,11 @@ from flax import nnx
 import jax.numpy as jnp
 
 NUM_BLOCKS = 8
-LATENT_DIM = 1024
+LATENT_DIM = 768
 BATCH_SIZE = 1
 ACCUMULATION_STEPS = 256
 MIN_STEPS = 8
-MAX_STEPS_LIMIT = 16
+MAX_STEPS_LIMIT = 32
 SHARED_SLOTS = 64
 MAX_SEQ_LEN = 1024
 VOCAB_SIZE = 100277
@@ -281,11 +281,15 @@ optimizer_chain = optax.MultiSteps(base_optimizer, every_k_schedule=ACCUMULATION
 
 
 def calculate_diversity_loss(expected_shared):
-    normed = expected_shared / (jnp.linalg.norm(expected_shared, axis=-1, keepdims=True) + 1e-8)
-    similarity = jnp.einsum('bsd,btd->bst', normed, normed)
+    dots = jnp.einsum('bsd,btd->bst', expected_shared, expected_shared)
+    norms = jnp.diagonal(dots, axis1=1, axis2=2)
+    
+    dist_sq = jnp.maximum(0.0, norms[:, :, None] + norms[:, None, :] - 2 * dots)
+    
+    repulsion = jnp.exp(-dist_sq / (LATENT_DIM**0.5 + 1e-6))
+    
     identity = jnp.eye(SHARED_SLOTS)[None, :, :]
-    off_diagonal_sim = jnp.abs(similarity - identity)
-    return jnp.mean(off_diagonal_sim)
+    return jnp.mean(repulsion * (1.0 - identity))
 
 
 @nnx.jit
