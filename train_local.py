@@ -20,7 +20,7 @@ MAX_SEQ_LEN = 1024
 VOCAB_SIZE = 100277
 PAD_TOKEN_ID = 100257
 FORGET_LAMBDA = 1e-5
-DIVERSITY_LAMBDA = 1.0
+DIVERSITY_LAMBDA = 0.6
 
 def rotate_half(x):
     x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]

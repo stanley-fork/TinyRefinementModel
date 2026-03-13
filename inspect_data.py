@@ -9,10 +9,9 @@ if hasattr(sys.stdout, 'reconfigure'):
 def inspect():
     sources = [
         ("FineWeb-Edu", "HuggingFaceFW/fineweb-edu", None),
-        ("FineWeb", "HuggingFaceFW/fineweb", None),
-        ("Python-Edu", "HuggingFaceTB/smollm-corpus", "python-edu"),
+        ("Python-Code (Verified)", "iamtarun/python_code_instructions_18k_alpaca", None),
         ("FineMath", "HuggingFaceTB/finemath", "finemath-4plus"),
-        ("Cosmopedia-v2", "HuggingFaceTB/cosmopedia-v2", None),
+        ("Cosmopedia-v2", "HuggingFaceTB/cosmopedia-v2", "cosmopedia-v2"),
     ]
 
     print("🔍 Beginning data source inspection...")
@@ -33,11 +32,15 @@ def inspect():
                         text_column = col
                         break
                 if text_column is None:
-                    text_column = next(k for k, v in item.items() if isinstance(v, str))
+                    # Fallback to the first string that isn't an ID
+                    text_column = next((k for k, v in item.items() 
+                                      if isinstance(v, str) and "id" not in k.lower()), None)
+                    if text_column is None:
+                        text_column = next(k for k, v in item.items() if isinstance(v, str))
 
                 res = f"✅ Fields found: {list(item.keys())}\n🎯 Logic selected column: '{text_column}'\n"
-                content = str(item[text_column]).replace('\n', ' ')
-                res += f"📄 Preview: {content[:200]}...\n"
+                content = str(item[text_column]).replace('\n', '\n    ') # Indent for readability
+                res += f"📄 Preview (2000 chars):\n    {content[:2000]}...\n"
                 print(res.strip())
                 out.write(res)
                 

@@ -46,11 +46,12 @@ def global_tokenize_item(text, max_seq_len, enc_name):
     return tokens
 
 class TextDataGenerator:
-    def __init__(self, dataset_name="HuggingFaceFW/fineweb-edu", max_seq_len=MAX_SEQ_LEN, config_name=None):
+    def __init__(self, dataset_name, max_seq_len=MAX_SEQ_LEN, config_name=None):
         self.max_seq_len = max_seq_len
         self.dataset_name = dataset_name
         self.config_name = config_name
         self.enc_name = "cl100k_base"
+        self.skip_count = 0
         
         self.iterator = None
         self.exhausted = False
@@ -61,7 +62,7 @@ class TextDataGenerator:
             return
 
         token = os.environ.get("HF_TOKEN")
-        print(f"🚀 Preparing {self.dataset_name}...")
+        print(f"🚀 Preparing {self.dataset_name} (Config: {self.config_name})...")
 
         ds_kwargs = {
             "path": self.dataset_name,
@@ -76,6 +77,10 @@ class TextDataGenerator:
             ds_kwargs["name"] = "default"
         
         ds = load_dataset(**ds_kwargs)
+        
+        if self.skip_count > 0:
+            print(f"⏩ Skipping {self.skip_count} items in {self.dataset_name}...")
+            ds = ds.skip(self.skip_count)
 
         self.iterator = self._curriculum_iterator(ds)
 
@@ -85,12 +90,12 @@ class TextDataGenerator:
             buffer.append(example)
             if len(buffer) >= SORT_BUFFER_SIZE:
                 if "score" in buffer[0]:
-                    buffer.sort(key=lambda x: x["score"])
+                    buffer.sort(key=lambda x: x.get("score", 0))
                 yield from buffer
                 buffer = []
         if buffer:
             if "score" in buffer[0]:
-                buffer.sort(key=lambda x: x["score"])
+                buffer.sort(key=lambda x: x.get("score", 0))
             yield from buffer
 
     def get_batch(self, batch_size):
@@ -105,9 +110,13 @@ class TextDataGenerator:
                 item = next(self.iterator)
                 
                 if text_column is None:
-                    text_column = next((col for col in ["text", "content"] if col in item), None)
+                    # Find the best column for content, avoiding metadata/IDs
+                    options = ["prompt", "text", "content", "code", "markdown"]
+                    text_column = next((col for col in options if col in item), None)
                     if text_column is None:
-                        text_column = next(k for k, v in item.items() if isinstance(v, str))
+                        # Fallback: find the longest string column that isn't an ID
+                        string_cols = [k for k, v in item.items() if isinstance(v, str)]
+                        text_column = next((k for k in string_cols if "id" not in k.lower()), string_cols[0])
 
                 batch_texts.append(item[text_column])
             except StopIteration:
@@ -117,8 +126,8 @@ class TextDataGenerator:
         if not batch_texts: return None
             
         tokenize_func = partial(global_tokenize_item, 
-                                max_seq_len=self.max_seq_len, 
-                                enc_name=self.enc_name)
+                                 max_seq_len=self.max_seq_len, 
+                                 enc_name=self.enc_name)
         
         batch_ids = self.pool.map(tokenize_func, batch_texts)
         return jnp.array(batch_ids, dtype=jnp.int32)
@@ -180,23 +189,6 @@ if __name__ == "__main__":
     model = UniversalReasoner(LATENT_DIM, nnx.Rngs(42))
     optimizer = nnx.Optimizer(model, optimizer_chain, wrt=nnx.Param)
 
-    print("🚀 Loading 2026 Foundation Pre-training Mixture...")
-    
-    fw_edu_gen = TextDataGenerator("HuggingFaceFW/fineweb-edu", MAX_SEQ_LEN)
-    
-    fw_gen = TextDataGenerator("HuggingFaceFW/fineweb", MAX_SEQ_LEN)
-    
-    code_gen = TextDataGenerator("HuggingFaceTB/cosmopedia-v2", MAX_SEQ_LEN, config_name="python-edu")
-    
-    math_gen = TextDataGenerator("HuggingFaceTB/finemath", MAX_SEQ_LEN, config_name="finemath-4plus") 
-
-    cosmo_gen = TextDataGenerator("HuggingFaceTB/cosmopedia-v2", MAX_SEQ_LEN, config_name="cosmopedia-v2")
-
-    sources = [fw_edu_gen, fw_gen, code_gen, math_gen, cosmo_gen]
-    weights = [0.50, 0.20, 0.15, 0.10, 0.05]
-    
-    data_gen = DataMixer(sources, weights)
-
     history_file = "training_history.csv"
     monitor = LossMonitor()
 
@@ -209,7 +201,6 @@ if __name__ == "__main__":
     if mngr.latest_step() is not None:
         latest_step = mngr.latest_step()
         print(f"📖 Loading Orbax checkpoint from step {latest_step}...")
-
         restored = mngr.restore(
             latest_step,
             args=ocp.args.Composite(
@@ -219,22 +210,35 @@ if __name__ == "__main__":
                 step=ocp.args.JsonRestore(),
             ),
         )
-
         nnx.update(model, restored["model"])
         nnx.update(optimizer, restored["optimizer"])
-
         start_step = restored["step"] + 1
-
         m_state = restored["monitor_state"]
         monitor.ce_history = m_state["ce_history"]
         monitor.best_ce = m_state["best_ce"]
         monitor.last_improvement_step = m_state["last_improvement_step"]
-
         print(f"✅ Resuming from step {start_step}")
     else:
         print("🆕 No checkpoint found, starting from scratch...")
         start_step = 1
 
+    print("🚀 Preparing Data Mixture (Balanced Reasoning & STEM)...")
+    sources = [
+        TextDataGenerator("HuggingFaceFW/fineweb-edu"),                   # 50% Primary High-Quality
+        TextDataGenerator("HuggingFaceFW/fineweb"),                       # 15% General Web
+        TextDataGenerator("iamtarun/python_code_instructions_18k_alpaca"), # 15% Python Instructions
+        TextDataGenerator("HuggingFaceTB/finemath", config_name="finemath-4plus"), # 15% Math
+        TextDataGenerator("HuggingFaceTB/cosmopedia-v2", config_name="cosmopedia-v2"), # 5% Synthetic 
+    ]
+    weights = [0.50, 0.15, 0.15, 0.15, 0.05]
+    
+    # Calculate skip counts for resume-safety
+    total_samples_seen = (start_step - 1) * BATCH_SIZE * ACCUMULATION_STEPS
+    if total_samples_seen > 0:
+        for gen, weight in zip(sources, weights):
+            gen.skip_count = int(total_samples_seen * weight)
+
+    data_gen = DataMixer(sources, weights)
     batch_queue = queue.Queue(maxsize=PREFETCH_SIZE)
     start_prefetch_worker(data_gen, BATCH_SIZE, batch_queue)
 
@@ -249,18 +253,16 @@ if __name__ == "__main__":
         ]}
 
         last_loss = None
-        batch = None
+        current_batch = None
 
         for i in range(ACCUMULATION_STEPS):
-            batch = batch_queue.get()
-            if batch is None:
-                break
+            current_batch = batch_queue.get()
+            if current_batch is None: break
 
             loss, (ce, p, forget_cost, halt_diag) = train_step(
-                model, optimizer, batch, step, FORGET_LAMBDA
+                model, optimizer, current_batch, step, FORGET_LAMBDA
             )
-            for k in step_diag:
-                step_diag[k] += halt_diag[k]
+            for k in step_diag: step_diag[k] += halt_diag[k]
 
             step_loss += loss
             step_ce += ce
@@ -268,11 +270,8 @@ if __name__ == "__main__":
             step_forget_cost += forget_cost
             last_loss = loss
 
-        if batch is None:
-            break
-
-        if last_loss is not None:
-            last_loss.block_until_ready()
+        if current_batch is None: break
+        if last_loss is not None: last_loss.block_until_ready()
 
         step_loss = float(step_loss) 
         step_ce = float(step_ce) / ACCUMULATION_STEPS
@@ -292,13 +291,11 @@ if __name__ == "__main__":
                 args=ocp.args.Composite(
                     model=ocp.args.StandardSave(nnx.state(model)),
                     optimizer=ocp.args.StandardSave(nnx.state(optimizer)),
-                    monitor_state=ocp.args.JsonSave(
-                        {
-                            "ce_history": monitor.ce_history,
-                            "best_ce": monitor.best_ce,
-                            "last_improvement_step": monitor.last_improvement_step,
-                        }
-                    ),
+                    monitor_state=ocp.args.JsonSave({
+                        "ce_history": monitor.ce_history,
+                        "best_ce": monitor.best_ce,
+                        "last_improvement_step": monitor.last_improvement_step,
+                    }),
                     step=ocp.args.JsonSave(step),
                 ),
             )
@@ -313,24 +310,16 @@ if __name__ == "__main__":
 
             write_header = not os.path.exists(history_file) or os.path.getsize(history_file) == 0
             with open(history_file, "a", newline="") as f:
-                fields = [
-                    "step", "loss", "ce", "avg_ponder", "avg_forget_cost", "t_total",
-                    "logits_mean", "logits_std", "logits_min", "logits_max", 
-                    "prob_mean", "prob_std", "saturation", "temporal_drift", 
-                    "forget_density", "logit_spread", "diversity_loss"
-                ]
-
+                fields = ["step", "loss", "ce", "avg_ponder", "avg_forget_cost", "t_total",
+                          "logits_mean", "logits_std", "logits_min", "logits_max", 
+                          "prob_mean", "prob_std", "saturation", "temporal_drift", 
+                          "forget_density", "logit_spread", "diversity_loss"]
                 writer = csv.DictWriter(f, fieldnames=fields)
-                if write_header:
-                    writer.writeheader()
+                if write_header: writer.writeheader()
                 
                 row = {
-                    "step": int(step),
-                    "loss": f"{step_loss:.4f}",
-                    "ce": f"{step_ce:.4f}",
-                    "avg_ponder": f"{step_p:.2f}",
-                    "avg_forget_cost": f"{step_forget_cost:.4f}",
-                    "t_total": f"{t_total:.2f}",
+                    "step": int(step), "loss": f"{step_loss:.4f}", "ce": f"{step_ce:.4f}",
+                    "avg_ponder": f"{step_p:.2f}", "avg_forget_cost": f"{step_forget_cost:.4f}", "t_total": f"{t_total:.2f}",
                 }
                 row.update({k: f"{v:.4f}" for k, v in step_diag.items() if k in fields})
                 writer.writerow(row)
