@@ -19,8 +19,6 @@ from train_local import (
     LATENT_DIM, MAX_SEQ_LEN, BATCH_SIZE, ACCUMULATION_STEPS, PAD_TOKEN_ID, FORGET_LAMBDA
 )
 
-
-
 load_dotenv()
 
 CHECKPOINT_INTERVAL = 10
@@ -178,7 +176,7 @@ if __name__ == "__main__":
         step_diag = {k: 0.0 for k in [
             'logits_mean', 'logits_std', 'logits_min', 'logits_max', 
             'prob_mean', 'prob_std', 'saturation', 'temporal_drift', 
-            'forget_density', 'logit_spread'
+            'forget_density', 'logit_spread', 'diversity_loss'
         ]}
 
         last_loss = None
@@ -250,7 +248,7 @@ if __name__ == "__main__":
                     "step", "loss", "ce", "avg_ponder", "avg_forget_cost", "t_total",
                     "logits_mean", "logits_std", "logits_min", "logits_max", 
                     "prob_mean", "prob_std", "saturation", "temporal_drift", 
-                    "forget_density", "logit_spread"
+                    "forget_density", "logit_spread", "diversity_loss"
                 ]
 
                 writer = csv.DictWriter(f, fieldnames=fields)

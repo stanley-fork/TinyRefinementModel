@@ -9,25 +9,25 @@ import optax
 from flax import nnx
 import jax.numpy as jnp
 
-NUM_BLOCKS = 4
-LATENT_DIM = 512
+NUM_BLOCKS = 8
+LATENT_DIM = 768
 BATCH_SIZE = 1
 ACCUMULATION_STEPS = 256
 MIN_STEPS = 8
-MAX_STEPS_LIMIT = 16
+MAX_STEPS_LIMIT = 32
 SHARED_SLOTS = 64
-MAX_SEQ_LEN = 512
+MAX_SEQ_LEN = 1024
 VOCAB_SIZE = 100277
 PAD_TOKEN_ID = 100257
 FORGET_LAMBDA = 1e-5
-DIVERSITY_LAMBDA = 0.2
+DIVERSITY_LAMBDA = 1.0
 
 def rotate_half(x):
     x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
     return jnp.concatenate([-x2, x1], axis=-1)
 
 class RotaryAttention(nnx.Module):
-    def __init__(self, num_heads, in_features, num_groups=2, rngs=None, dtype=jnp.float32):
+    def __init__(self, num_heads, in_features, num_groups=4, rngs=None, dtype=jnp.float32):
         self.num_heads = num_heads
         self.num_groups = num_groups
         self.head_dim = in_features // num_heads
@@ -141,7 +141,7 @@ class UniversalReasoner(nnx.Module):
         self.time_embed = nnx.Embed(MAX_STEPS_LIMIT + 1, latent_dim, dtype=dtype, rngs=rngs)
 
         self.shared_token = nnx.Param(
-            jax.random.normal(rngs(), (1, SHARED_SLOTS, latent_dim)).astype(jnp.float32) * 0.02
+            jax.nn.initializers.orthogonal()(rngs(), (1, SHARED_SLOTS, latent_dim), jnp.float32)
         )
 
         self.seq_norm = nnx.RMSNorm(latent_dim, rngs=rngs, dtype=dtype)

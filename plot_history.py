@@ -34,9 +34,12 @@ def plot_training_history(log_path="training_history.csv"):
                     'loss': float(row['loss']),
                     'ce': float(row.get('ce', 0)),
                     'avg_ponder': float(row.get('avg_ponder', 0)),
-                    # CSV writes avg_forget_cost; accept avg_t_cost for backward compatibility
-                    'avg_t_cost': float(row.get('avg_forget_cost', row.get('avg_t_cost', 0))),
-                    't_total': float(row.get('t_total', 0))
+                    'avg_forget_cost': float(row.get('avg_forget_cost', 0)),
+                    't_total': float(row.get('t_total', 0)),
+                    'saturation': float(row.get('saturation', 0)),
+                    'temporal_drift': float(row.get('temporal_drift', 0)),
+                    'forget_density': float(row.get('forget_density', 0)),
+                    'diversity_loss': float(row.get('diversity_loss', 0))
                 })
     except Exception as e:
         print(f"❌ Error reading {log_path}: {e}")
@@ -50,7 +53,7 @@ def plot_training_history(log_path="training_history.csv"):
     losses = np.array([entry['loss'] for entry in history])
     ce_losses = np.array([entry['ce'] for entry in history])
     ponder_steps = np.array([entry['avg_ponder'] for entry in history])
-    avg_t_costs = np.array([entry['avg_t_cost'] for entry in history])
+    avg_forget_costs = np.array([entry['avg_forget_cost'] for entry in history])
     times = np.array([entry['t_total'] for entry in history])
 
     plt.style.use('dark_background')
@@ -76,23 +79,26 @@ def plot_training_history(log_path="training_history.csv"):
     ax2.grid(True, linestyle='--', alpha=0.3)
     ax2.legend(loc='upper right')
 
-    # Temporal Cost
-    ax3.plot(steps, avg_t_costs, color='#ffcc00', linewidth=2.5, label='Temporal Cost', marker='o', markersize=4)
-    ax3.fill_between(steps, avg_t_costs, color='#ffcc00', alpha=0.1)
-    ax3.set_ylabel('T-Cost', color='#ffcc00', fontweight='bold', fontsize=11)
-    ax3.set_title('Temporal Consistency Cost (Lower = Better)', fontsize=14, pad=10, color='white', fontweight='bold')
+    # Forget Cost
+    ax3.plot(steps, avg_forget_costs, color='#ffcc00', linewidth=2.5, label='Forget Cost', marker='o', markersize=4)
+    ax3.fill_between(steps, avg_forget_costs, color='#ffcc00', alpha=0.1)
+    ax3.set_ylabel('F-Cost', color='#ffcc00', fontweight='bold', fontsize=11)
+    ax3.set_title('Forget Consistency Cost (Lower = Better)', fontsize=14, pad=10, color='white', fontweight='bold')
     ax3.grid(True, linestyle='--', alpha=0.3)
     ax3.legend(loc='upper right')
 
     # Ponder Steps
-    ax4.plot(steps, ponder_steps, color='#adff2f', linewidth=2.5, label='Avg Ponder Steps', marker='o', markersize=4)
-    ax4.fill_between(steps, ponder_steps, color='#adff2f', alpha=0.1)
+    # Offset by 8 to show actual steps instead of just the penalty cost
+    actual_ponder_steps = ponder_steps + 8
+    ax4.plot(steps, actual_ponder_steps, color='#adff2f', linewidth=2.5, label='Actual Steps', marker='o', markersize=4)
+    ax4.fill_between(steps, actual_ponder_steps, color='#adff2f', alpha=0.1)
     ax4.axhline(y=16, color='#adff2f', linestyle='--', alpha=0.5, label='MAX (16 steps)')
+    ax4.axhline(y=8, color='#ff6b6b', linestyle=':', alpha=0.5, label='MIN (8 steps)')
     ax4.set_ylabel('Steps', color='#adff2f', fontweight='bold', fontsize=11)
     ax4.set_xlabel('Training Step', fontweight='bold', fontsize=11)
-    ax4.set_title('Average Ponder Steps (Model Learning Depth)', fontsize=14, pad=10, color='white', fontweight='bold')
+    ax4.set_title('Average Reasoning Depth (Total Steps)', fontsize=14, pad=10, color='white', fontweight='bold')
     ax4.grid(True, linestyle='--', alpha=0.3)
-    ax4.legend(loc='upper left')
+    ax4.legend(loc='lower left')
     
     # Apply log scale only to loss plots (ax1, ax2)
     for ax in [ax1, ax2]:
@@ -134,7 +140,7 @@ def plot_training_history(log_path="training_history.csv"):
     recent_time_window = times[-20:] if len(times) >= 20 else times
     avg_step_time = np.mean(recent_time_window)
     
-    elapsed_time = np.sum(times)  # Use actual total time, not estimated
+    elapsed_time = np.sum(times) * 10  # Use actual total time, not estimated
 
     print(f"\n{'='*60}")
     print(f"📊 TRAINING STATUS")
@@ -144,8 +150,14 @@ def plot_training_history(log_path="training_history.csv"):
     print(f"⚡ Avg Time per Step: {avg_step_time:.2f}s")
     print(f"📈 Current CE Loss: {ce_losses[-1]:.4f}")
     print(f"📉 Current Perplexity: {ppl[-1]:.2f}")
-    print(f"🧠 Current Avg Ponder Steps: {ponder_steps[-1]:.2f}")
-    print(f"⚙️  Current Temporal Cost: {avg_t_costs[-1]:.4f}")
+    # Show actual steps (Cost + 8)
+    print(f"🧠 Current Reasoning Depth: {ponder_steps[-1] + 8:.2f} steps")
+    print(f"⚙️  Current Forget Cost: {avg_forget_costs[-1]:.4f}")
+    if history[-1].get('saturation'):
+        print(f"🧩 Memory Saturation: {history[-1]['saturation']:.4f}")
+        print(f"🌊 Temporal Drift: {history[-1]['temporal_drift']:.4f}")
+        print(f"🧹 Forget Density: {history[-1]['forget_density']:.4f}")
+        print(f"🌈 Diversity Loss: {history[-1]['diversity_loss']:.4f}")
     
     # Calculate learning dynamics
     if len(steps) > 10:
@@ -256,13 +268,14 @@ def plot_diagnostics(log_path="training_history.csv"):
     ax1.grid(True, linestyle='--', alpha=0.3)
     ax1.legend(loc='upper right')
 
-    # Probabilities Plot
-    ax2.plot(steps, p_mean, color='#ffcc00', label='Mean Prob', linewidth=2)
-    ax2.fill_between(steps, p_mean - p_std, p_mean + p_std, color='#ffcc00', alpha=0.2, label='±1σ')
-    ax2.set_ylabel('Probability', fontweight='bold')
+    # Reasoning Depth (Steps)
+    ax2.plot(steps, p_mean, color='#ffcc00', label='Mean Depth (Steps)', linewidth=2)
+    # Log std is still prob-based, but we plot it relative to mean steps to show noise
+    ax2.fill_between(steps, p_mean - (p_std * 4), p_mean + (p_std * 4), color='#ffcc00', alpha=0.2, label='±4σ Spread')
+    ax2.set_ylabel('Step Count', fontweight='bold')
     ax2.set_xlabel('Training Step', fontweight='bold')
-    ax2.set_title('Halt Probability Diagnostics', fontsize=14, pad=10)
-    ax2.set_ylim([-0.05, 1.05])
+    ax2.set_title('Halt Decision Stability (Calculated Steps)', fontsize=14, pad=10)
+    ax2.set_ylim([7, 17])
     ax2.grid(True, linestyle='--', alpha=0.3)
     ax2.legend(loc='upper right')
 
@@ -271,7 +284,63 @@ def plot_diagnostics(log_path="training_history.csv"):
     print(f"✨ Halt diagnostics plot updated: halt_diagnostics.png")
     plt.close()
 
+def plot_reasoning_dynamics(log_path="training_history.csv"):
+    if not os.path.exists(log_path):
+        return
+
+    history = []
+    try:
+        with open(log_path, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if 'saturation' in row and row['saturation']:
+                    history.append({
+                        'step': int(row['step']),
+                        'saturation': float(row['saturation']),
+                        'temporal_drift': float(row['temporal_drift']),
+                        'forget_density': float(row['forget_density']),
+                        'diversity_loss': float(row.get('diversity_loss', 0))
+                    })
+    except Exception as e:
+        print(f"⚠️ Error reading reasoning dynamics from {log_path}: {e}")
+        return
+
+    if not history:
+        return
+
+    steps = np.array([entry['step'] for entry in history])
+    sat = np.array([entry['saturation'] for entry in history])
+    drift = np.array([entry['temporal_drift'] for entry in history])
+    forget = np.array([entry['forget_density'] for entry in history])
+    div = np.array([entry['diversity_loss'] for entry in history])
+
+    plt.style.use('dark_background')
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10), sharex=True)
+
+    # Saturation & Drift
+    ax1.plot(steps, sat, color='#ff00ff', label='Memory Saturation (Lower = Better)', linewidth=2)
+    ax1.plot(steps, drift, color='#00ff00', label='Temporal Drift (Higher = More Active)', linewidth=2)
+    ax1.set_ylabel('Score', fontweight='bold')
+    ax1.set_title('Latent Dynamics: Saturation vs Activity', fontsize=14, pad=10)
+    ax1.grid(True, linestyle='--', alpha=0.3)
+    ax1.legend(loc='upper right')
+
+    # Forget & Diversity
+    ax2.plot(steps, forget, color='#ff8800', label='Forget Density', linewidth=2)
+    ax2.plot(steps, div, color='#0088ff', label='Diversity Loss', linewidth=2)
+    ax2.set_ylabel('Cost/Density', fontweight='bold')
+    ax2.set_xlabel('Training Step', fontweight='bold')
+    ax2.set_title('Internal Control: Forgetting & Diversity', fontsize=14, pad=10)
+    ax2.grid(True, linestyle='--', alpha=0.3)
+    ax2.legend(loc='upper right')
+
+    plt.tight_layout()
+    plt.savefig('reasoning_dynamics.png', dpi=150, bbox_inches='tight')
+    print(f"✨ Reasoning dynamics plot updated: reasoning_dynamics.png")
+    plt.close()
+
 if __name__ == "__main__":
     log_file = "training_history.csv"
     plot_training_history(log_file)
     plot_diagnostics(log_file)
+    plot_reasoning_dynamics(log_file)
