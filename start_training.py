@@ -25,7 +25,7 @@ from train_local import (
 load_dotenv()
 
 CHECKPOINT_INTERVAL = 10
-SORT_BUFFER_SIZE = 10_000
+SORT_BUFFER_SIZE = 1000
 PREFETCH_SIZE = 16
 
 GLOBAL_POOL = None
@@ -53,6 +53,7 @@ class TextDataGenerator:
         self.config_name = config_name
         self.enc_name = "cl100k_base"
         self.skip_count = 0
+        self.items_yielded = 0
         
         self.iterator = None
         self.exhausted = False
@@ -79,9 +80,10 @@ class TextDataGenerator:
         
         ds = load_dataset(**ds_kwargs)
         
-        if self.skip_count > 0:
-            print(f"⏩ Skipping {self.skip_count} items in {self.dataset_name}...")
-            ds = ds.skip(self.skip_count)
+        total_skip = self.skip_count + self.items_yielded
+        if total_skip > 0:
+            print(f"⏩ Fast-forwarding {total_skip} items in {self.dataset_name}...")
+            ds = ds.skip(total_skip)
 
         self.iterator = self._curriculum_iterator(ds)
 
@@ -109,6 +111,7 @@ class TextDataGenerator:
         while len(batch_texts) < batch_size:
             try:
                 item = next(self.iterator)
+                self.items_yielded += 1
                 
                 if text_column is None:
                     # Find the best column for content, avoiding metadata/IDs
@@ -123,6 +126,11 @@ class TextDataGenerator:
             except StopIteration:
                 self.exhausted = True
                 break
+            except Exception as e:
+                print(f"⚠️ Stream error in {self.dataset_name}: {e}. Reconnecting...")
+                self.iterator = None
+                self._ensure_iterator()
+                continue
         
         if not batch_texts: return None
             
