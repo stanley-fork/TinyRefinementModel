@@ -9,12 +9,12 @@ import optax
 from flax import nnx
 import jax.numpy as jnp
 
-NUM_BLOCKS = 8
+NUM_BLOCKS = 4
 LATENT_DIM = 768
 BATCH_SIZE = 1
 ACCUMULATION_STEPS = 256
 MIN_STEPS = 8
-MAX_STEPS_LIMIT = 32
+MAX_STEPS_LIMIT = 16
 SHARED_SLOTS = 64
 MAX_SEQ_LEN = 1024
 VOCAB_SIZE = 100277
@@ -153,6 +153,8 @@ class UniversalReasoner(nnx.Module):
         self.halt_head.bias.value = jnp.full((1,), -2.0) 
         
         self.time_norm = nnx.RMSNorm(latent_dim, rngs=rngs, dtype=dtype)
+        self.forget_norm = nnx.RMSNorm(latent_dim, rngs=rngs, dtype=dtype)
+        self.time_signal_norm = nnx.RMSNorm(latent_dim, rngs=rngs, dtype=dtype)
 
         self.use_forget = use_forget
         if self.use_forget:
@@ -183,7 +185,7 @@ class UniversalReasoner(nnx.Module):
             shared_ctx = jnp.concatenate([z_seq, curr_shared], axis=1)
             shared_kv_pos = jnp.concatenate([seq_pos, shared_pos])
 
-            stack_input = self.time_norm(curr_shared) + (t_signal[None, None, :] * 0.1)
+            stack_input = self.time_norm(curr_shared) + self.time_signal_norm(t_signal[None, None, :])
             
             new_shared = self.main_stack(
                 stack_input, context=shared_ctx, mask=extended_ctx_mask,
@@ -191,7 +193,8 @@ class UniversalReasoner(nnx.Module):
             )
 
             if self.use_forget:
-                forget = jax.nn.sigmoid(self.forget_head(new_shared))
+                forget_gate_input = self.forget_norm(new_shared)
+                forget = jax.nn.sigmoid(self.forget_head(forget_gate_input))
                 new_shared = forget * new_shared + (1.0 - forget) * curr_shared
                 forget_val = jnp.mean(jnp.abs(forget), axis=(1, 2))
             else:
@@ -281,12 +284,12 @@ optimizer_chain = optax.MultiSteps(base_optimizer, every_k_schedule=ACCUMULATION
 
 
 def calculate_diversity_loss(expected_shared):
-    dots = jnp.einsum('bsd,btd->bst', expected_shared, expected_shared)
-    norms = jnp.diagonal(dots, axis1=1, axis2=2)
+    norms = jnp.linalg.norm(expected_shared, axis=-1, keepdims=True) + 1e-6
+    normalized_shared = expected_shared / norms
     
-    dist_sq = jnp.maximum(0.0, norms[:, :, None] + norms[:, None, :] - 2 * dots)
+    dots = jnp.einsum('bsd,btd->bst', normalized_shared, normalized_shared)
     
-    repulsion = jnp.exp(-dist_sq / (LATENT_DIM**0.5 + 1e-6))
+    repulsion = jnp.exp(-(1.0 - dots) / 0.5)
     
     identity = jnp.eye(SHARED_SLOTS)[None, :, :]
     return jnp.mean(repulsion * (1.0 - identity))
