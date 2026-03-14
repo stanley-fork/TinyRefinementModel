@@ -10,7 +10,7 @@ from flax import nnx
 import jax.numpy as jnp
 
 NUM_BLOCKS = 8
-LATENT_DIM = 768
+LATENT_DIM = 512
 BATCH_SIZE = 1
 ACCUMULATION_STEPS = 256
 MIN_STEPS = 8
@@ -260,12 +260,14 @@ class UniversalReasoner(nnx.Module):
         forget_loss = jnp.sum(step_weights * all_forget_l1, axis=0)
         
         flat_shared = expected_shared.reshape(-1, self.latent_dim)
-        slot_corr = jnp.corrcoef(flat_shared)
+        norms = jnp.sqrt(jnp.sum(jnp.square(flat_shared), axis=-1, keepdims=True) + 1e-8)
+        normalized = flat_shared / norms
+        slot_corr = normalized @ normalized.T
         saturation_score = jnp.mean(jnp.abs(slot_corr))
 
-        drift = jnp.linalg.norm(all_shared[-1] - all_shared[0]) / (jnp.linalg.norm(all_shared[0]) + 1e-7)
-        forget_density = jnp.mean(all_forget_l1)
-        logit_spread = jnp.max(all_logits) - jnp.min(all_logits)
+        diff_sq = jnp.sum(jnp.square(all_shared[-1] - all_shared[0]), axis=-1)
+        base_sq = jnp.sum(jnp.square(all_shared[0]), axis=-1)
+        drift = jnp.sqrt(diff_sq + 1e-8) / (jnp.sqrt(base_sq + 1e-8))
 
         halt_diag = {
             'logits_mean': jnp.mean(all_logits),
@@ -314,16 +316,16 @@ optimizer_chain = optax.MultiSteps(base_optimizer, every_k_schedule=ACCUMULATION
 
 
 def calculate_diversity_loss(expected_shared):
-    norms = jnp.linalg.norm(expected_shared, axis=-1, keepdims=True) + 1e-6
+    norms = jnp.sqrt(jnp.sum(jnp.square(expected_shared), axis=-1, keepdims=True) + 1e-8)
     normalized_shared = expected_shared / norms
     
     dots = jnp.einsum('bsd,btd->bst', normalized_shared, normalized_shared)
+    dots = jnp.clip(dots, -1.0, 1.0)
     
     repulsion = jnp.exp(-(1.0 - dots) / 0.5)
     
     identity = jnp.eye(SHARED_SLOTS)[None, :, :]
     return jnp.mean(repulsion * (1.0 - identity))
-
 
 @nnx.jit
 def train_step(model, opt, batch_tokens, step, f_lambda, prev_hunch=None):
