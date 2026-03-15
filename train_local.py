@@ -371,7 +371,10 @@ def train_step(model, opt, batch_tokens, step, f_lambda, prev_hunch=None, should
     
     *metrics, next_hunch = aux
     
-    should_refresh = (step % HUNCH_REFRESH_EVERY == 0)
+    # If should_truncate is True, we break the gradient chain here.
+    # Also, we break it if the global step says so.
+    should_refresh = should_truncate | (step % HUNCH_REFRESH_EVERY == 0)
+    
     next_hunch = jax.lax.cond(
         should_refresh,
         lambda x: jax.lax.stop_gradient(x),

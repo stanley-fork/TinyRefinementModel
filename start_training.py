@@ -1,7 +1,7 @@
 import os
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "true"
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.9"
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.8"
 os.environ["TF_GPU_ALLOCATOR"] = "cuda_malloc_async"
 #os.environ["XLA_FLAGS"] = '--xla_force_host_platform_device_count=8'
 
@@ -304,12 +304,12 @@ if __name__ == "__main__":
                 model, optimizer, current_batch, step, FORGET_LAMBDA, prev_hunch=hunch,
                 should_truncate=should_truncate
             )
-            for k in step_diag: step_diag[k] += halt_diag[k]
+            for k in step_diag: step_diag[k] += float(halt_diag[k])
 
-            step_loss += loss
-            step_ce += ce
-            step_p += p
-            step_forget_cost += forget_cost
+            step_loss += float(loss)
+            step_ce += float(ce)
+            step_p += float(p)
+            step_forget_cost += float(forget_cost)
             last_loss = loss
 
         if current_batch is None: break
