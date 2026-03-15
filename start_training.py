@@ -1,18 +1,22 @@
-import jax
+import os
+
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "true"
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.9"
+os.environ["TF_GPU_ALLOCATOR"] = "cuda_malloc_async"
+#os.environ["XLA_FLAGS"] = '--xla_force_host_platform_device_count=8'
+
 import jax.numpy as jnp
 from flax import nnx
 import orbax.checkpoint as ocp
 import csv
 import time
 import tiktoken
-import os
 import threading
 import queue
 import multiprocessing as mp
 import concurrent.futures
 from functools import partial
 from dotenv import load_dotenv
-import jax.lax as lax
 import numpy as np
 from datasets import load_dataset
 from train_local import (
