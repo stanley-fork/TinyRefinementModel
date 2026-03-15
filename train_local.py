@@ -1,8 +1,9 @@
 import os
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "true"
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.8"
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.9"
 os.environ["TF_GPU_ALLOCATOR"] = "cuda_malloc_async"
+#os.environ["XLA_FLAGS"] = '--xla_force_host_platform_device_count=8'
 
 import jax
 import optax
@@ -10,18 +11,18 @@ from flax import nnx
 import jax.numpy as jnp
 
 NUM_BLOCKS = 4
-LATENT_DIM = 512
+LATENT_DIM = 768
 BATCH_SIZE = 1
-ACCUMULATION_STEPS = 256
-MIN_STEPS = 8
-MAX_STEPS_LIMIT = 32
+ACCUMULATION_STEPS = 128
+MIN_STEPS = 4
+MAX_STEPS_LIMIT = 16
 SHARED_SLOTS = 64
 MAX_SEQ_LEN = 1024
 VOCAB_SIZE = 100277
 PAD_TOKEN_ID = 100257
 FORGET_LAMBDA = 1e-5
-DIVERSITY_LAMBDA = 0.6
-HUNCH_REFRESH_EVERY = 16
+DIVERSITY_LAMBDA = 10.0
+HUNCH_REFRESH_EVERY = 4
 
 def rotate_half(x):
     x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
@@ -195,9 +196,8 @@ class UniversalReasoner(nnx.Module):
         z_shared_base = jnp.tile(self.shared_token.value, (batch_size, 1, 1))
 
         if current_hunch is not None:
-            prev_hunch_sg = jax.lax.stop_gradient(current_hunch)
-            gate = jax.nn.sigmoid(self.hunch_gate(self.hunch_norm(prev_hunch_sg)))
-            z_shared = gate * prev_hunch_sg + (1.0 - gate) * z_shared_base
+            gate = jax.nn.sigmoid(self.hunch_gate(self.hunch_norm(current_hunch)))
+            z_shared = gate * current_hunch + (1.0 - gate) * z_shared_base
         else:
             z_shared = z_shared_base
 
@@ -314,7 +314,7 @@ ponder_lambda_schedule = optax.warmup_cosine_decay_schedule(
 )
 base_optimizer = optax.chain(
     optax.clip_by_global_norm(1.0),
-    optax.adafactor(learning_rate=schedule, multiply_by_parameter_scale=True),
+    optax.adamw(learning_rate=schedule),
 )
 optimizer_chain = optax.MultiSteps(base_optimizer, every_k_schedule=ACCUMULATION_STEPS)
 
@@ -324,12 +324,10 @@ def calculate_diversity_loss(expected_shared):
     normalized_shared = expected_shared / norms
     
     dots = jnp.einsum('bsd,btd->bst', normalized_shared, normalized_shared)
-    dots = jnp.clip(dots, -1.0, 1.0)
-    
-    repulsion = jnp.exp(-(1.0 - dots) / 0.5)
     
     identity = jnp.eye(SHARED_SLOTS)[None, :, :]
-    return jnp.mean(repulsion * (1.0 - identity))
+    
+    return jnp.mean(jnp.square(dots - identity))
 
 @nnx.jit
 def train_step(model, opt, batch_tokens, step, f_lambda, prev_hunch=None):
@@ -363,5 +361,12 @@ def train_step(model, opt, batch_tokens, step, f_lambda, prev_hunch=None):
 
     (loss, aux), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
     opt.update(model, grads)
-    *metrics, expected_shared = aux
-    return loss, tuple(metrics), expected_shared
+    
+    *metrics, next_hunch = aux
+    
+    # Periodically stop gradient to keep the "Truncation" window 
+    # (e.g., every 4 steps) to prevent memory growth.
+    if step % 4 == 0:
+        next_hunch = jax.lax.stop_gradient(next_hunch)
+        
+    return loss, tuple(metrics), next_hunch

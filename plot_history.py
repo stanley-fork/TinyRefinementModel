@@ -3,7 +3,9 @@ import matplotlib.pyplot as plt
 import os
 import numpy as np
 import sys
-from train_local import BATCH_SIZE, MAX_SEQ_LEN, ACCUMULATION_STEPS
+from train_local import BATCH_SIZE, MAX_SEQ_LEN, ACCUMULATION_STEPS, UniversalReasoner, LATENT_DIM
+from flax import nnx
+import jax
 
 # Ensure UTF-8 encoding for console output
 if hasattr(sys.stdout, 'reconfigure'):
@@ -106,6 +108,11 @@ def plot_training_history(log_path="training_history.csv"):
     print("✨ Analytics updated: reasoning_analytics.png")
     #make the tokens outputted with x.xxx.xxx so i can clearly see the millions and thousands
     print(f"Amount of tokens trained so far: {calculate_tokens(steps[-1]):,}")
+
+    model = UniversalReasoner(LATENT_DIM, nnx.Rngs(0))
+    params = nnx.state(model, nnx.Param)
+    param_count = sum(x.size for x in jax.tree_util.tree_leaves(params))
+    print(f"Model Parameters: {param_count:,}")
 
     print(f"Last CE change: {ce[-1] - ce[-2]}")
     print(f"Lowest CE so far: {min(ce)}")
