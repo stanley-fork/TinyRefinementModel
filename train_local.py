@@ -330,7 +330,7 @@ def calculate_diversity_loss(expected_shared):
     return jnp.mean(jnp.square(dots - identity))
 
 @nnx.jit
-def train_step(model, opt, batch_tokens, step, f_lambda, prev_hunch=None):
+def train_step(model, opt, batch_tokens, step, f_lambda, prev_hunch=None, should_truncate=False):
     def loss_fn(model):
         inputs, targets = batch_tokens[:, :-1], batch_tokens[:, 1:]
 
@@ -364,9 +364,12 @@ def train_step(model, opt, batch_tokens, step, f_lambda, prev_hunch=None):
     
     *metrics, next_hunch = aux
     
-    # Periodically stop gradient to keep the "Truncation" window 
-    # (e.g., every 4 steps) to prevent memory growth.
-    if step % 4 == 0:
-        next_hunch = jax.lax.stop_gradient(next_hunch)
-        
+    should_refresh = (step % HUNCH_REFRESH_EVERY == 0)
+    next_hunch = jax.lax.cond(
+        should_refresh,
+        lambda x: jax.lax.stop_gradient(x),
+        lambda x: x,
+        next_hunch
+    )
+    
     return loss, tuple(metrics), next_hunch

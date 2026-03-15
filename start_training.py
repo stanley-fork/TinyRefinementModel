@@ -295,11 +295,10 @@ if __name__ == "__main__":
             current_batch = batch_queue.get()
             if current_batch is None: break
             
-            if i % HUNCH_REFRESH_EVERY == 0:
-                hunch = None
-
+            should_truncate = (i % HUNCH_REFRESH_EVERY == 0 and i > 0)
             loss, (ce, p, forget_cost, halt_diag), hunch = train_step(
-                model, optimizer, current_batch, step, FORGET_LAMBDA, prev_hunch=hunch
+                model, optimizer, current_batch, step, FORGET_LAMBDA, prev_hunch=hunch,
+                should_truncate=should_truncate
             )
             for k in step_diag: step_diag[k] += halt_diag[k]
 
