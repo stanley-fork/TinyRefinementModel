@@ -51,7 +51,7 @@ while true; do
               python3 start_training.py; \
               gcloud compute tpus queued-resources delete $QR_ID --zone=$ZONE --quiet
             '
-          '
+          "
 
           # Run it non-interactively
           gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --command="$SETUP_CMD"
