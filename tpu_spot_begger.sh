@@ -7,7 +7,14 @@ ACCELERATOR_TYPE="v5litepod-8"
 RUNTIME_VERSION="v2-alp1ha-tpuv5-lite" # Optimized for JAX on v5e
 
 # Prioritized: Home region first, then cheapest egress, then anywhere else
-ZONES=("us-central1-a" "us-central1-b" "us-south1-a" "us-west1-c" "europe-west4-b" "southamerica-west1-a")
+ZONES=(
+  "us-central1-a" "us-central1-b" "us-central1-c" 
+  "us-south1-a" 
+  "us-west1-c" "us-west4-a" 
+  "europe-west4-a" "europe-west4-b" 
+  "southamerica-west1-a"
+  "us-east7-ai1b" "us-south1-ai1b" "us-central1-ai1a" "europe-west4-ai1a"
+)
 
 echo "🎯 Starting the hunt. Data bucket is in us-central1."
 
