@@ -315,10 +315,19 @@ class UniversalReasoner(nnx.Module):
 
 
 
-schedule = optax.warmup_cosine_decay_schedule(1e-6, 4e-4, 400, 1000, 5e-6)
+schedule = optax.warmup_cosine_decay_schedule(
+    init_value=1e-6, 
+    peak_value=5.6e-4,  # Adjusted for larger batch
+    warmup_steps=400, 
+    decay_steps=1000, 
+    end_value=5e-6
+)
 ponder_lambda_schedule = optax.warmup_cosine_decay_schedule(
-    init_value = 0.0, peak_value = 0.0, warmup_steps = 400, 
-    decay_steps = 1000, end_value = 2e-4
+    init_value=0.0, 
+    peak_value=0.0, 
+    warmup_steps=400, 
+    decay_steps=1000, 
+    end_value=2e-4
 )
 optimizer_chain = optax.chain(
     optax.clip_by_global_norm(1.0),
