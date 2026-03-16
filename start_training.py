@@ -204,7 +204,8 @@ if __name__ == "__main__":
     state = jax.tree.map(lambda x: jax.device_put(x, replicated_sharding), state)
     nnx.update((model, optimizer), state)
 
-    history_file = "training_history.csv"
+    # In start_training.py, find where history_file is defined:
+    history_file = f"{CHECKPOINT_ROOT}/training_history.csv"
     monitor = LossMonitor()
 
     mngr = ocp.CheckpointManager(
@@ -357,14 +358,16 @@ if __name__ == "__main__":
                 f"      Prob [μ:{step_diag['prob_mean']:.3f}, σ:{step_diag['prob_std']:.3f}] | Sat: {step_diag['saturation']:.3f} | Drift: {step_diag['temporal_drift']:.3f} | Forget: {step_diag['forget_density']:.3f}\n"
             )
 
-            write_header = not os.path.exists(history_file) or os.path.getsize(history_file) == 0
-            with open(history_file, "a", newline="") as f:
+            with fsspec.open(history_file, "a", newline="") as f:
                 fields = ["step", "loss", "ce", "avg_ponder", "avg_forget_cost", "t_total", "data_wait", "compute_time",
                           "logits_mean", "logits_std", "logits_min", "logits_max", 
                           "prob_mean", "prob_std", "saturation", "temporal_drift", 
                           "forget_density", "logit_spread", "diversity_loss"]
                 writer = csv.DictWriter(f, fieldnames=fields)
-                if write_header: writer.writeheader()
+                
+                # Check if file is empty to write header
+                if f.tell() == 0: 
+                    writer.writeheader()
                 
                 row = {
                     "step": int(step), "loss": f"{step_loss:.4f}", "ce": f"{step_ce:.4f}",
