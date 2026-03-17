@@ -231,8 +231,11 @@ if __name__ == "__main__":
             ),
         )
 
-        # CRITICAL FIX: Update both at once to preserve immutable node links
-        nnx.update((model, optimizer), (restored["model"], restored["optimizer"]))
+        # Update model parameters
+        nnx.update(model, restored["model"])
+        
+        # Update optimizer state (this handles the Adam 'count' and moments)
+        nnx.update(optimizer, restored["optimizer"])
         
         start_step = restored["step"] + 1
         m_state = restored["monitor_state"]
