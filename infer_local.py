@@ -5,6 +5,7 @@ from flax import nnx
 import tiktoken
 import orbax.checkpoint as ocp
 import time
+from functools import partial
 
 from train_local import (
     UniversalReasoner,
@@ -23,46 +24,16 @@ load_dotenv()
 CHECKPOINT_DIR = os.environ.get("CHECKPOINT_ROOT", "orbax_checkpoints")
 #os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
-def analyze_first_token_contenders(logits, enc, expected_token=None, top_k_count=20):
-    probs = jax.nn.softmax(logits)
-    top_indices = jnp.argsort(logits)[-top_k_count:][::-1]
-    
-    print("\n" + "─" * 30)
-    print("🎯 Expected First Token Contenders:")
-    found_expected = False
-    for rank, idx in enumerate(top_indices):
-        token_val = int(idx)
-        token_str = enc.decode([token_val]).replace("\n", "\\n")
-        prob = float(probs[idx])
-        marker = "⭐" if expected_token and expected_token in token_str else "  "
-        if marker == "⭐": found_expected = True
-        print(f"{marker} {rank+1}. Rank: {token_val:6} | Prob: {prob:6.2%} | Token: [{token_str}]")
-    
-    if expected_token and not found_expected:
-        all_ranks = jnp.argsort(logits)[::-1]
-        expected_ids = enc.encode(expected_token)
-        if expected_ids:
-            target_id = expected_ids[0]
+@partial(nnx.jit, static_argnames=['refresh'])
+def get_next_logits(model, padded_tks, valid_len, refresh):
+    logits = run_model_inference(model, padded_tks, max_steps=MAX_STEPS_LIMIT, should_refresh=refresh)
+    return logits[0, valid_len - 1, :]
 
-            actual_rank = int(jnp.where(all_ranks == target_id)[0][0]) + 1
-            actual_prob = float(probs[target_id])
-            actual_str = enc.decode([target_id]).replace("\n", "\\n")
-            print(f"--- Expected Token Not in Top {top_k_count} ---")
-            print(f"⭐ {actual_rank}. Rank: {target_id:6} | Prob: {actual_prob:6.4%} | Token: [{actual_str}]")
-
-    print("─" * 30)
-    print("🤖 Assistant: ", end="", flush=True)
-
-def generate_text(model, enc, prompt, max_new_tokens=128, temperature=0.8, expected_token=None):
+def generate_text(model, enc, prompt, max_new_tokens=128, temperature=0.8):
     seed = int(time.time() * 1000) % (2**31)
     rng = jax.random.PRNGKey(seed)
 
     tokens_list = enc.encode(prompt)
-
-    @nnx.jit(static_argnames=['refresh'])
-    def get_next_logits(m, padded_tks, valid_len, refresh):
-        logits = run_model_inference(m, padded_tks, max_steps=MAX_STEPS_LIMIT, should_refresh=refresh)
-        return logits[0, valid_len - 1, :]
 
     print("🤖 Assistant: ", end="", flush=True)
 
@@ -78,9 +49,6 @@ def generate_text(model, enc, prompt, max_new_tokens=128, temperature=0.8, expec
         should_refresh = (i % HUNCH_REFRESH_EVERY == 0)
 
         logits = get_next_logits(model, input_ids, valid_len, should_refresh)
-
-        if i == 0:
-            analyze_first_token_contenders(logits, enc, expected_token)
 
         rng, subkey = jax.random.split(rng)
 
@@ -140,10 +108,7 @@ def run_inference():
             if not user_input:
                 continue
 
-            expected_input = input("❓ Expected first token (optional): ").strip()
-            expected_token = expected_input if expected_input else None
-
-            generate_text(model, enc, user_input, expected_token=expected_token)
+            generate_text(model, enc, user_input)
             print("-" * 30)
 
         except KeyboardInterrupt:
