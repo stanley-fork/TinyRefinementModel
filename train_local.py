@@ -34,8 +34,8 @@ class RotaryAttention(nnx.Module):
         t = jnp.arange(MAX_SEQ_LEN + SHARED_SLOTS)
         freqs = jnp.outer(t, inv_freq)
         freqs = jnp.concatenate([freqs, freqs], axis=-1)
-        self.sin_cached = jnp.sin(freqs)
-        self.cos_cached = jnp.cos(freqs)
+        self.sin_cached = jnp.sin(freqs).astype(dtype)
+        self.cos_cached = jnp.cos(freqs).astype(dtype)
 
         self.cache = nnx.Cache(None)
 
