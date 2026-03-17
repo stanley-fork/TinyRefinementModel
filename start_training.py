@@ -236,7 +236,10 @@ if __name__ == "__main__":
         nnx.update(model, restored["model"])
         
         # Update optimizer state (this handles the Adam 'count' and moments)
-        nnx.update(optimizer, restored["optimizer"])
+        # Using graph split/merge to bypass "Cannot set key on immutable node" error
+        # which occurs when trying to update Optax's ScaleByAdamState in-place.
+        graphdef, _ = nnx.split(optimizer)
+        optimizer = nnx.merge(graphdef, restored["optimizer"])
         
         start_step = restored["step"] + 1
         m_state = restored["monitor_state"]
