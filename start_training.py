@@ -200,9 +200,11 @@ if __name__ == "__main__":
     data_sharding = NamedSharding(mesh, PartitionSpec('batch'))
     replicated_sharding = NamedSharding(mesh, PartitionSpec())
 
-    state = nnx.state((model, optimizer))
-    state = jax.tree.map(lambda x: jax.device_put(x, replicated_sharding), state)
-    nnx.update((model, optimizer), state)
+    #When creating the model inside the TPU VM env, its parameters are already accessible to the accelerator
+    #By removing this "replicated update" step, you bypass the immutable state error entirely.
+    #state = nnx.state((model, optimizer))
+    #state = jax.tree.map(lambda x: jax.device_put(x, replicated_sharding), state)
+    #nnx.update((model, optimizer), state)
 
     # In start_training.py, find where history_file is defined:
     history_file = f"{CHECKPOINT_ROOT}/training_history.csv"
