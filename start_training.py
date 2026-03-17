@@ -32,6 +32,7 @@ load_dotenv()
 CHECKPOINT_INTERVAL = 100
 SORT_BUFFER_SIZE = 1000
 PREFETCH_SIZE = 16
+PHASE_STEP = 3000
 
 # Root paths for Data and Checkpoints
 DATA_ROOT = os.environ.get("DATA_ROOT", "")
@@ -263,13 +264,13 @@ if __name__ == "__main__":
     chat_mixer = TextDataGenerator(f"{DATA_ROOT}/chat/ultrachat")
 
     if start_step > 1:
-        if start_step < 10000:
+        if start_step < PHASE_STEP:
             total_pretrain_seen = (start_step - 1) * BATCH_SIZE
             weights = [0.60, 0.25, 0.15]
             for gen, weight in zip(pretrain_sources, weights):
                 gen.skip_count = int(total_pretrain_seen * weight)
         else:
-            total_chat_seen = (start_step - 10000) * BATCH_SIZE
+            total_chat_seen = (start_step - PHASE_STEP) * BATCH_SIZE
             chat_mixer.skip_count = total_chat_seen
 
     # --- PREFETCH INTEGRATION ---
@@ -279,7 +280,7 @@ if __name__ == "__main__":
         """Handles switching between mixers based on global step."""
         current_step = start_step
         while True:
-            if current_step < 10000:
+            if current_step < PHASE_STEP:
                 batch = pretrain_mixer.get_batch(BATCH_SIZE)
             else:
                 batch = chat_mixer.get_batch(BATCH_SIZE)
@@ -311,7 +312,7 @@ if __name__ == "__main__":
             print("🏁 Data stream exhausted.")
             break
         
-        if step == 10000:
+        if step == PHASE_STEP:
             print("🚀 PHASE SHIFT: Transitioning to Chat Fine-tuning...")
 
         current_batch = jax.device_put(current_batch, data_sharding)
