@@ -1,3 +1,4 @@
+from flax import linen as nn
 import jax
 import optax
 from flax import nnx
@@ -79,7 +80,7 @@ class RotaryAttention(nnx.Module):
         k_expanded = jnp.repeat(k, repeats, axis=2)
         v_expanded = jnp.repeat(v, repeats, axis=2)
 
-        out = jax.nn.dot_product_attention(
+        out = nn.attention.dot_product_attention(
             q, k_expanded, v_expanded,
             mask=jnp.broadcast_to(mask, (mask.shape[0], self.num_heads, q.shape[1], k_expanded.shape[1]))
             if mask is not None else None,
