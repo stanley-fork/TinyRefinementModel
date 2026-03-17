@@ -4,11 +4,11 @@ from flax import nnx
 import jax.numpy as jnp
 
 #Params
-LATENT_DIM = 1024
-NUM_BLOCKS = 12
+LATENT_DIM = 768
+NUM_BLOCKS = 8
 SHARED_SLOTS = 128
 VOCAB_SIZE = 100277
-MAX_STEPS_LIMIT = 32
+MAX_STEPS_LIMIT = 16
 
 #Training
 MAX_SEQ_LEN = 2048
