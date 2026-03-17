@@ -33,16 +33,18 @@ CHECKPOINT_INTERVAL = 100
 SORT_BUFFER_SIZE = 1000
 PREFETCH_SIZE = 16
 
-# Root paths for Data and Checkpoints (MUST be gs:// for Cloud TPU)
+# Root paths for Data and Checkpoints
 DATA_ROOT = os.environ.get("DATA_ROOT", "")
-CHECKPOINT_ROOT = os.environ.get("CHECKPOINT_ROOT", "")
+CHECKPOINT_ROOT = os.environ.get("CHECKPOINT_ROOT", "orbax_checkpoints")
 
-if not DATA_ROOT.startswith("gs://") or not CHECKPOINT_ROOT.startswith("gs://"):
-    import sys
-    print(f"🛑 Error: DATA_ROOT and CHECKPOINT_ROOT must be GCS bucket links (starting with gs://).")
-    print(f"   Current DATA_ROOT: {DATA_ROOT}")
-    print(f"   Current CHECKPOINT_ROOT: {CHECKPOINT_ROOT}")
-    sys.exit(1)
+# Relaxing GCS enforcement: DATA_ROOT can be GCS or local. 
+# CHECKPOINT_ROOT is now allowed to be local.
+if not DATA_ROOT:
+    print(f"⚠️ Warning: DATA_ROOT is not set. Data loading will likely fail unless provided via environment.")
+    
+print(f"📁 Checkpoints will be saved to: {CHECKPOINT_ROOT}")
+if not CHECKPOINT_ROOT.startswith("gs://"):
+    print(f"ℹ️ Note: Saving locally. You will need to manually sync to GCS using: gsutil -m cp -r {CHECKPOINT_ROOT} gs://YOUR_BUCKET/")
 
 GLOBAL_POOL = None
 
