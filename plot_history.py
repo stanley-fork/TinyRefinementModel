@@ -3,34 +3,53 @@ import matplotlib.pyplot as plt
 import os
 import numpy as np
 import sys
-from train_local import BATCH_SIZE, MAX_SEQ_LEN, UniversalReasoner, LATENT_DIM, NUM_BLOCKS, VOCAB_SIZE, SHARED_SLOTS, MAX_STEPS_LIMIT
+import argparse
+from train_local import (
+    BATCH_SIZE, 
+    MAX_SEQ_LEN, 
+    LATENT_DIM, 
+    NUM_BLOCKS, 
+    VOCAB_SIZE, 
+    SHARED_SLOTS, 
+    MAX_STEPS_LIMIT,
+    ACCUMULATION_STEPS,
+    NUM_HEADS,
+    NUM_GROUPS
+)
 
 # Ensure UTF-8 encoding for console output
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
 
-def format_time(seconds):
-    hours = int(seconds // 3600)
-    minutes = int((seconds % 3600) // 60)
-    secs = int(seconds % 60)
-    return f"{hours}h {minutes}m {secs}s" if hours > 0 else f"{minutes}m {secs}s"
+def smooth(y, box_pts):
+    """Simple moving average smoothing."""
+    if len(y) < box_pts:
+        return np.array(y)
+    box = np.ones(box_pts) / box_pts
+    y_smooth = np.convolve(y, box, mode='valid')
+    
+    # Pad so original shape is maintained
+    pad_front = box_pts // 2
+    pad_back = len(y) - len(y_smooth) - pad_front
+    return np.pad(y_smooth, (pad_front, pad_back), mode='edge')
 
 def calculate_tokens(step):
-    total = step * BATCH_SIZE * MAX_SEQ_LEN
-    return total
+    """
+    Calculate total tokens seen across all micro-batches.
+    'step' from the logs represents the number of micro-batches processed.
+    Each micro-batch processes 2 consecutive windows of MAX_SEQ_LEN.
+    """
+    return step * BATCH_SIZE * (MAX_SEQ_LEN * 2)
 
 def print_model_stats():
     print("Calculating model parameters (mathematical estimation)...")
     
-    # Architecture Constants
-    num_heads = 8
-    num_groups = 2 
-    head_dim = LATENT_DIM // num_heads
+    head_dim = LATENT_DIM // NUM_HEADS
     
     # 1. Block Stack (Per Block)
     q_params = LATENT_DIM * LATENT_DIM + LATENT_DIM
-    k_params = LATENT_DIM * (num_groups * head_dim) + (num_groups * head_dim)
-    v_params = LATENT_DIM * (num_groups * head_dim) + (num_groups * head_dim)
+    k_params = LATENT_DIM * (NUM_GROUPS * head_dim) + (NUM_GROUPS * head_dim)
+    v_params = LATENT_DIM * (NUM_GROUPS * head_dim) + (NUM_GROUPS * head_dim)
     o_params = LATENT_DIM * LATENT_DIM + LATENT_DIM
     attn_total = q_params + k_params + v_params + o_params
     
@@ -64,111 +83,143 @@ def print_model_stats():
     param_count = num_reason_param + encoder_params
     
     print(f"Model Parameters: {param_count:,}")
-    print(f"(encoder params: {encoder_params:,}\n Layers params: {num_reason_param:,} across {NUM_BLOCKS} layers}})")
+    print(f"  |-- Encoder Params : {encoder_params:,}")
+    print(f"  |-- Layer Params   : {num_reason_param:,} (across {NUM_BLOCKS} blocks)")
 
 def plot_training_history(log_path="training_history.csv"):
     if not os.path.exists(log_path):
         print(f"❌ Error: {log_path} not found.")
+        print("Note: The CSV is now stored in your CHECKPOINT_ROOT (default is ./).")
         return
 
     history = []
     try:
-        with open(log_path, 'r') as f:
+        with open(log_path, 'r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
             for row in reader:
-                history.append({
-                    'step': int(row['step']),
-                    'loss': float(row['loss']),
-                    'ce': float(row.get('ce', 0)),
-                    'avg_ponder': float(row.get('avg_ponder', 0)),
-                    'saturation': float(row.get('saturation', 0)),
-                    'drift': float(row.get('temporal_drift', 0)),
-                    'forget': float(row.get('forget_density', 0)),
-                    'spread': float(row.get('logit_spread', 0)),
-                    'l_mean': float(row.get('logits_mean', 0)),
-                    't_total': float(row.get('t_total', 0)),
-                })
+                try:
+                    history.append({
+                        'step': int(row['step']),
+                        'loss':  float(row.get('loss', 0)),
+                        'ce': float(row.get('ce', 0)),
+                        'first_ce': float(row.get('first_ce', 0)),
+                        'ponder': float(row.get('avg_ponder', 0)),
+                        'steps': float(row.get('expected_steps', 0)),
+                        'diversity': float(row.get('diversity_loss', 0)),
+                        'forget_cost': float(row.get('avg_forget_cost', 0)),
+                        'storage_cost': float(row.get('avg_storage_cost', 0)),
+                        'grad_norm': float(row.get('grad_norm_avg', 0)),
+                        'saturation': float(row.get('saturation', 0)),
+                        'temporal_drift': float(row.get('temporal_drift', 0)),
+                    })
+                except ValueError:
+                    continue 
     except Exception as e:
         print(f"❌ Error reading {log_path}: {e}")
+        return
+
+    if len(history) == 0:
+        print("ℹ️ Warning: No valid training data found in CSV.")
         return
 
     steps = np.array([e['step'] for e in history])
     losses = np.array([e['loss'] for e in history])
     ce = np.array([e['ce'] for e in history])
-    ponder = np.array([e['avg_ponder'] for e in history])
-    drift = np.array([e['drift'] for e in history])
-    sat = np.array([e['saturation'] for e in history])
-    forget = np.array([e['forget'] for e in history])
-    spread = np.array([e['spread'] for e in history])
-    l_mean = np.array([e['l_mean'] for e in history])
+    first_ce = np.array([e['first_ce'] for e in history])
+    ponder = np.array([e['ponder'] for e in history])
+    exp_steps = np.array([e['steps'] for e in history])
+    diversity = np.array([e['diversity'] for e in history])
+    forget = np.array([e['forget_cost'] for e in history])
+    storage = np.array([e['storage_cost'] for e in history])
+    grad_norm = np.array([e['grad_norm'] for e in history])
+    saturation = np.array([e['saturation'] for e in history])
+    temporal_drift = np.array([e['temporal_drift'] for e in history])
 
     plt.style.use('dark_background')
-    fig, axes = plt.subplots(5, 1, figsize=(14, 24), sharex=True)
-    (ax1, ax2, ax3, ax4, ax5) = axes
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    ((ax1, ax2), (ax3, ax4)) = axes
 
-    # --- 1. CONVERGENCE (Loss vs CE) ---
-    ax1.plot(steps, losses, color='#00f2ff', alpha=0.4, label='Agg Loss (Penalty Included)')
-    ax1.plot(steps, ce, color='#ff007b', linewidth=2, label='CE Loss (Pure Accuracy)')
-    ax1.set_yscale('log')
-    ax1.set_title('Convergence: Accuracy vs. Structural Penalty', fontsize=14, fontweight='bold')
-    ax1.legend(loc='upper right')
-    ax1.grid(True, alpha=0.2)
+    smoothing_window = max(5, min(100, len(steps) // 20))
 
-    # --- 2. REASONING EFFICIENCY (Drift / Ponder) ---
-    efficiency = drift / (ponder + 1e-6)
-    ax2.plot(steps, efficiency, color='#adff2f', linewidth=2, label='Efficiency (Drift/Step)')
-    ax2.set_title('Reasoning Efficiency: Knowledge Gained per Thought Step', fontsize=14, fontweight='bold')
-    ax2.set_ylabel('Ratio', color='#adff2f')
+    # --- 1. CONVERGENCE (CE vs First Step) ---
+    ax1.plot(steps, first_ce, color='#ff007b', alpha=0.2, linestyle='--', label='Initial Guess (Step 0)')
+    ax1.plot(steps, ce, color='#ff007b', alpha=0.2, label='Final Prediction')
+    ax1.plot(steps, smooth(ce, smoothing_window), color='#ff007b', linewidth=2, label='Smoothed Final CE')
+    ax1.fill_between(steps, smooth(ce, smoothing_window), smooth(first_ce, smoothing_window), 
+                     color='#ff007b', alpha=0.1, label='Refinement Gain')
+    ax1.set_title('Convergence & Refinement', fontsize=14, fontweight='bold')
+    ax1.set_ylabel('Cross Entropy')
+    if np.all(ce > 0): ax1.set_yscale('log')
+    ax1.legend()
+    ax1.grid(True, alpha=0.1)
+
+    # --- 2. REASONING INTENSITY (Steps & Saturation) ---
+    ax2.plot(steps, exp_steps, color='#adff2f', alpha=0.4, label='Expected Steps')
+    ax2_twin = ax2.twinx()
+    ax2_twin.plot(steps, saturation, color='#ffcc00', alpha=0.3, label='Saturation (%)')
+    ax2_twin.set_ylabel('Saturation %', color='#ffcc00')
+    ax2.plot(steps, smooth(exp_steps, smoothing_window), color='#adff2f', linewidth=2, label='Smoothed Steps')
+    ax2.set_title('Reasoning Intensity', fontsize=14, fontweight='bold')
+    ax2.set_ylabel('Steps', color='#adff2f')
     ax2.legend(loc='upper left')
-    
-    # Dual axis for total Drift
-    ax2_b = ax2.twinx()
-    ax2_b.plot(steps, drift, color='#00ff00', alpha=0.3, label='Raw Temporal Drift')
-    ax2_b.set_ylabel('Total Drift', color='#00ff00')
-    ax2.grid(True, alpha=0.2)
+    ax2_twin.legend(loc='upper right')
+    ax2.grid(True, alpha=0.1)
 
-    # --- 3. EXPERT DYNAMICS (Saturation vs Logits) ---
-    ax3.plot(steps, sat, color='#ff00ff', linewidth=2, label='Memory Saturation (Lower = Better)')
-    ax3.set_ylabel('Saturation', color='#ff00ff')
-    ax3.set_title('Expert Specialization & Halt Decision', fontsize=14, fontweight='bold')
-    
-    ax3_b = ax3.twinx()
-    ax3_b.plot(steps, l_mean, color='#ffcc00', linestyle='--', alpha=0.6, label='Halt Logit Mean')
-    ax3_b.set_ylabel('Logit Mean', color='#ffcc00')
-    ax3.legend(loc='upper right')
-    ax3.grid(True, alpha=0.2)
+    # --- 3. RESOURCE COSTS (Forget & Storage) ---
+    ax3.plot(steps, smooth(forget, smoothing_window), color='#00ff88', linewidth=2, label='Forget Cost')
+    ax3.plot(steps, smooth(storage, smoothing_window), color='#00f2ff', linewidth=2, label='Storage Cost')
+    ax3.set_title('Dynamic Resource Penalties', fontsize=14, fontweight='bold')
+    ax3.set_xlabel('Training Step')
+    ax3.set_ylabel('Cost Value')
+    ax3.legend()
+    ax3.grid(True, alpha=0.1)
 
-    # --- 4. DECISIVENESS (Logit Spread & Ponder) ---
-    ax4.plot(steps, spread, color='#ffffff', linewidth=1.5, label='Logit Spread (Decisiveness)')
-    ax4.set_ylabel('Spread', color='#ffffff')
-    
-    ax4_b = ax4.twinx()
-    ax4_b.plot(steps, ponder, color='#ff8800', linewidth=2, label='Avg Ponder Steps')
-    ax4_b.set_ylim([0, 17])
-    ax4_b.set_ylabel('Steps', color='#ff8800')
-    ax4.set_title('Internal Decisiveness vs Reasoning Depth', fontsize=14, fontweight='bold')
+    # --- 4. MODEL HEALTH (Grad Norm & Diversity) ---
+    ax4.plot(steps, smooth(grad_norm, smoothing_window), color='#ffffff', linewidth=2, label='Grad Norm')
+    ax4_twin = ax4.twinx()
+    ax4_twin.plot(steps, smooth(diversity, smoothing_window), color='#ff00ff', linewidth=1, label='Diversity Loss')
+    ax4_twin.set_ylabel('Diversity Loss', color='#ff00ff')
+    ax4.set_title('Optimization Health', fontsize=14, fontweight='bold')
     ax4.set_xlabel('Training Step')
-    ax4.legend(loc='lower right')
-
-    # --- 5. MEMORY MANAGEMENT (Forgetting) ---
-    ax5.plot(steps, forget, color='#00ff88', linewidth=2, label='Forget Density (Active Pruning)')
-    ax5.set_ylabel('Density', color='#00ff88')
-    ax5.set_title('Memory Management: Information Pruning Intensity', fontsize=14, fontweight='bold')
-    ax5.legend(loc='upper right')
-    ax5.grid(True, alpha=0.2)
+    ax4.set_ylabel('Gradient Norm')
+    if np.any(grad_norm > 0): ax4.set_yscale('log')
+    ax4.legend(loc='upper left')
+    ax4_twin.legend(loc='upper right')
+    ax4.grid(True, alpha=0.1)
 
     plt.tight_layout()
-    plt.savefig('reasoning_analytics.png', dpi=150)
-    print("✨ Analytics updated: reasoning_analytics.png")
-    #make the tokens outputted with x.xxx.xxx so i can clearly see the millions and thousands
-    print(f"Amount of tokens trained so far: {calculate_tokens(steps[-1]):,}")
+    output_image = 'reasoning_analytics.png'
+    plt.savefig(output_image, dpi=150)
+    print(f"✨ Analytics updated: {output_image}")
+    
+    # Post-Training Summary
+    print("-" * 50)
+    print("📊 POST-TRAINING SUMMARY")
+    print("-" * 50)
+    
+    total_tokens = calculate_tokens(steps[-1]) if len(steps) > 0 else 0
+    print(f"Total Tokens Trained     : {total_tokens:,}")
+    
+    if len(ce) > 1:
+        print(f"Recent CE Change         : {ce[-1] - ce[-2]:.5f}")
+    
+    print(f"Lowest CE Observed       : {np.min(ce):.5f}")
+    
+    valid_ce = ce[~np.isnan(ce)]
+    if len(valid_ce) > 0:
+        window_size = min(100, len(valid_ce))
+        print(f"Final 100-step Avg CE    : {np.mean(valid_ce[-window_size:]):.5f}")
 
-    print(f"Last CE change: {ce[-1] - ce[-2]}")
-    print(f"Lowest CE so far: {min(ce)}")
-
+    print("-" * 50)
     print_model_stats()
+    print("-" * 50)
 
     plt.close()
 
 if __name__ == "__main__":
-    plot_training_history()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--log', type=str, default="training_history.csv", 
+                        help="Path to training_history.csv")
+    args = parser.parse_args()
+    
+    plot_training_history(log_path=args.log)

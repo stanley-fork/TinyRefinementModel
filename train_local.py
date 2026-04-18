@@ -1,31 +1,60 @@
-from flax import linen as nn
 import jax
 import optax
-from flax import nnx
+from flax import nnx, struct
 import jax.numpy as jnp
+from typing import Dict, Any
+
+#Keep (most) values powers of 2 if you know what's good for you
 
 #Params
-LATENT_DIM = 768
-NUM_BLOCKS = 8
-SHARED_SLOTS = 64
-VOCAB_SIZE = 100277
-MAX_STEPS_LIMIT = 32
+LATENT_DIM = 512
+NUM_BLOCKS = 4
+SHARED_SLOTS = 32
+MAX_SEQ_LEN = 512
+VOCAB_SIZE = 100352
 
 #Training
-MAX_SEQ_LEN = 1024
-MIN_STEPS = 8
-BATCH_SIZE = 32
+MAX_STEPS_LIMIT = 16
+MIN_STEPS = 4
+BATCH_SIZE = 1
+ACCUMULATION_STEPS = 128
 PAD_TOKEN_ID = 100257
-FORGET_LAMBDA = 1e-6
-DIVERSITY_LAMBDA = 0.5
-HUNCH_REFRESH_EVERY = 4
 
-def rotate_half(x):
-    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
-    return jnp.concatenate([-x2, x1], axis=-1)
+NUM_HEADS = 16
+NUM_GROUPS = NUM_HEADS // 4
+
+@struct.dataclass
+class ScanStepOutput:
+    shared_state: jnp.ndarray
+    halt_prob: jnp.ndarray
+    forget_val: jnp.ndarray
+    storage_val: jnp.ndarray
+    halt_logit: jnp.ndarray
+    step_div: jnp.ndarray
+    step_weight: jnp.ndarray
+
+@struct.dataclass
+class ReasonerOutput:
+    logits: jnp.ndarray
+    ponder_cost: float
+    forget_cost: float
+    storage_cost: float
+    diversity_loss: float
+    halt_diag: Dict[str, Any]
+    expected_shared: jnp.ndarray
+
+def apply_rope(x, cos, sin):
+    d = x.shape[-1]
+    x1, x2 = jnp.split(x, 2, axis=-1)
+    
+    x_complex = jax.lax.complex(x1, x2)
+    rope_complex = jax.lax.complex(cos, sin)
+    rotated = x_complex * rope_complex
+    
+    return jnp.concatenate([rotated.real, rotated.imag], axis=-1).astype(x.dtype)
 
 class RotaryAttention(nnx.Module):
-    def __init__(self, num_heads, in_features, num_groups=4, rngs=None, dtype=jnp.bfloat16):
+    def __init__(self, num_heads, in_features, num_groups=4, rngs=None, dtype=jnp.float32):
         self.num_heads = num_heads
         self.num_groups = num_groups
         self.head_dim = in_features // num_heads
@@ -34,78 +63,129 @@ class RotaryAttention(nnx.Module):
         inv_freq = 1.0 / (10000 ** (jnp.arange(0, self.head_dim, 2) / self.head_dim))
         t = jnp.arange(MAX_SEQ_LEN + SHARED_SLOTS)
         freqs = jnp.outer(t, inv_freq)
-        freqs = jnp.concatenate([freqs, freqs], axis=-1)
-        self.sin_cached = jnp.sin(freqs).astype(dtype)
-        self.cos_cached = jnp.cos(freqs).astype(dtype)
+        self.sin_cached = jnp.sin(freqs)
+        self.cos_cached = jnp.cos(freqs)
 
-        self.cache = nnx.Cache(None)
+        self.k_cache = nnx.Cache(None)
+        self.v_cache = nnx.Cache(None)
+        self.cache_index = nnx.Cache(jnp.array(0, dtype=jnp.int32))
 
-        self.q_proj = nnx.Linear(in_features, in_features, rngs=rngs, dtype=dtype)
-        self.k_proj = nnx.Linear(in_features, self.num_groups * self.head_dim, rngs=rngs, dtype=dtype)
-        self.v_proj = nnx.Linear(in_features, self.num_groups * self.head_dim, rngs=rngs, dtype=dtype)
-        self.o_proj = nnx.Linear(in_features, in_features, rngs=rngs, dtype=dtype)
+        self.q_proj = nnx.Linear(in_features, in_features, rngs=rngs, dtype=jnp.float16)
+        self.k_proj = nnx.Linear(in_features, self.num_groups * self.head_dim, rngs=rngs, dtype=jnp.float16)
+        self.v_proj = nnx.Linear(in_features, self.num_groups * self.head_dim, rngs=rngs, dtype=jnp.float16)
 
-    def __call__(self, x, context=None, mask=None, q_pos=None, kv_pos=None, use_cache=False):
+        self.q_norm = nnx.RMSNorm(self.head_dim, epsilon=1e-6, rngs=rngs, dtype=jnp.float32)
+        self.k_norm = nnx.RMSNorm(self.head_dim, epsilon=1e-6, rngs=rngs, dtype=jnp.float32)
+
+        self.o_proj = nnx.Linear(in_features, in_features, rngs=rngs, dtype=jnp.float16)
+
+    def reset_state(self):
+        self.k_cache.value = None
+        self.v_cache.value = None
+        self.cache_index.value = jnp.zeros_like(self.cache_index.value)
+
+    def __call__(self, x, context=None, mask=None, q_pos=None, kv_pos=None, use_cache=False, is_causal=True):
         b, s, d = x.shape
         q = self.q_proj(x).reshape(b, s, self.num_heads, self.head_dim)
 
         kv_input = context if context is not None else x
+        
         s_kv = kv_input.shape[1]
 
         k = self.k_proj(kv_input).reshape(b, s_kv, self.num_groups, self.head_dim)
         v = self.v_proj(kv_input).reshape(b, s_kv, self.num_groups, self.head_dim)
 
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
         if q_pos is None:
             q_pos = jnp.arange(s)
         if kv_pos is None:
             kv_pos = jnp.arange(s_kv)
-#
-        sin_q = self.sin_cached[q_pos, None, :]
+
         cos_q = self.cos_cached[q_pos, None, :]
-        q = (q * cos_q) + (rotate_half(q) * sin_q)
+        sin_q = self.sin_cached[q_pos, None, :]
+        q = apply_rope(q, cos_q, sin_q)
         q = q * self.scale
 
-        sin_kv = self.sin_cached[kv_pos, None, :]
         cos_kv = self.cos_cached[kv_pos, None, :]
-        k = (k * cos_kv) + (rotate_half(k) * sin_kv)
+        sin_kv = self.sin_cached[kv_pos, None, :]
+        k = apply_rope(k, cos_kv, sin_kv)
 
         if use_cache:
-            if self.cache.value is not None:
-                prev_k, prev_v = self.cache.value
-                k = jnp.concatenate([prev_k, k], axis=1)
-                v = jnp.concatenate([prev_v, v], axis=1)
-            self.cache.value = (k, v)
+            if self.k_cache.value is None:
+                cache_shape = (b, MAX_SEQ_LEN + SHARED_SLOTS, self.num_groups, self.head_dim)
+                self.k_cache.value = jnp.zeros(cache_shape, dtype=x.dtype)
+                self.v_cache.value = jnp.zeros(cache_shape, dtype=x.dtype)
+            
+            idx = self.cache_index.value
+            k_cache = jax.lax.dynamic_update_slice(self.k_cache.value, k, (0, idx, 0, 0))
+            v_cache = jax.lax.dynamic_update_slice(self.v_cache.value, v, (0, idx, 0, 0))
+            self.k_cache.value = k_cache
+            self.v_cache.value = v_cache
+            new_idx = idx + s_kv
+            self.cache_index.value = new_idx
+            
+            k = k_cache[:, :new_idx, :, :]
+            v = v_cache[:, :new_idx, :, :]
+        if self.num_heads != self.num_groups:
+            repeats = self.num_heads // self.num_groups
+            k = jnp.repeat(k, repeats, axis=2)
+            v = jnp.repeat(v, repeats, axis=2)
 
-        repeats = self.num_heads // self.num_groups
-        k_expanded = jnp.repeat(k, repeats, axis=2)
-        v_expanded = jnp.repeat(v, repeats, axis=2)
+        if is_causal:
+            pos_mask = q_pos[:, None] >= kv_pos[None, :]
+            
+            if mask is not None:
+                if mask.dtype == jnp.bool_:
+                    mask = mask & pos_mask
+                else:
+                    mask = mask + (pos_mask.astype(jnp.float32) - 1.0) * 1e9
+            else:
+                mask = pos_mask
+            
+            effective_is_causal = False
+        else:
+            effective_is_causal = False
+            
+        q = q.astype(jnp.float16)
+        k = k.astype(jnp.float16)
+        v = v.astype(jnp.float16)
+        
+        if mask is not None and mask.dtype != jnp.bool_:
+            attn_bias = mask.astype(jnp.float16)
+            mask_arg = None
+        else:
+            attn_bias = None
+            mask_arg = mask
 
-        out = nn.attention.dot_product_attention(
-            q, k_expanded, v_expanded,
-            mask=jnp.broadcast_to(mask, (mask.shape[0], self.num_heads, q.shape[1], k_expanded.shape[1]))
-            if mask is not None else None,
+        out = jax.nn.dot_product_attention(
+            q, k, v,
+            mask=mask_arg, 
+            bias=attn_bias,
+            is_causal=effective_is_causal,
         )
         return self.o_proj(out.reshape(b, s, d))
 
 
 class StandardReasoningBlock(nnx.Module):
-    def __init__(self, latent_dim, num_heads, rngs, dtype=jnp.bfloat16):
-        self.attn = RotaryAttention(num_heads, latent_dim, num_groups=4, rngs=rngs, dtype=dtype)
-        self.norm1 = nnx.RMSNorm(latent_dim, rngs=rngs, dtype=dtype)
-        self.norm2 = nnx.RMSNorm(latent_dim, rngs=rngs, dtype=dtype)
+    def __init__(self, latent_dim, num_heads, rngs, dtype=jnp.float32):
+        self.attn = RotaryAttention(num_heads, latent_dim, num_groups=NUM_GROUPS, rngs=rngs, dtype=dtype)
+        self.norm1 = nnx.RMSNorm(latent_dim, epsilon=1e-6, rngs=rngs, dtype=dtype)
+        self.norm2 = nnx.RMSNorm(latent_dim, epsilon=1e-6, rngs=rngs, dtype=dtype)
 
         hidden_dim = int(256 * ((latent_dim * 8 / 3 + 255) // 256))
-        self.gate_proj = nnx.Linear(latent_dim, hidden_dim, rngs=rngs, dtype=dtype)
-        self.up_proj = nnx.Linear(latent_dim, hidden_dim, rngs=rngs, dtype=dtype)
+        self.gate_proj = nnx.Linear(latent_dim, hidden_dim, rngs=rngs, dtype=jnp.float16)
+        self.up_proj = nnx.Linear(latent_dim, hidden_dim, rngs=rngs, dtype=jnp.float16)
         self.down_proj = nnx.Linear(
             hidden_dim, latent_dim,
             kernel_init=jax.nn.initializers.zeros,
-            rngs=rngs, dtype=dtype,
+            rngs=rngs, dtype=jnp.float16,
         )
 
-    def __call__(self, x, context=None, mask=None, q_pos=None, kv_pos=None, use_cache=False):
+    def __call__(self, x, context=None, mask=None, q_pos=None, kv_pos=None, use_cache=False, is_causal=True):
         normed_context = self.norm1(context) if context is not None else None
-        attn_out = self.attn(self.norm1(x), context=normed_context, mask=mask, q_pos=q_pos, kv_pos=kv_pos, use_cache=use_cache)
+        attn_out = self.attn(self.norm1(x), context=normed_context, mask=mask, q_pos=q_pos, kv_pos=kv_pos, use_cache=use_cache, is_causal=is_causal)
         x = x + attn_out
 
         mlp_in = self.norm2(x)
@@ -116,284 +196,347 @@ class StandardReasoningBlock(nnx.Module):
 
 
 class BlockStack(nnx.Module):
-    def __init__(self, num_blocks, latent_dim, num_heads, rngs, dtype=jnp.bfloat16):
-        self.blocks = [
-            StandardReasoningBlock(latent_dim, num_heads, rngs=rngs, dtype=dtype)
-            for _ in range(num_blocks)
-        ]
+    def __init__(self, num_blocks, latent_dim, num_heads, rngs, dtype=jnp.float32, share_weights=False):
         self.num_blocks = num_blocks
+        self.share_weights = share_weights
+        if share_weights:
+            self.blocks = nnx.List([
+                StandardReasoningBlock(latent_dim, num_heads, rngs=rngs, dtype=dtype)
+            ])
+        else:
+            self.blocks = nnx.List([
+                StandardReasoningBlock(latent_dim, num_heads, rngs=rngs, dtype=dtype)
+                for _ in range(num_blocks)
+            ])
 
     def reset_state(self):
         for block in self.blocks:
-            block.attn.cache.value = None
+            block.attn.reset_state()
 
-    def __call__(self, x, context=None, mask=None, q_pos=None, kv_pos=None, use_cache=False):
-        for block in self.blocks:
-            x = block(x, context=context, mask=mask, q_pos=q_pos, kv_pos=kv_pos, use_cache=use_cache)
+    def __call__(self, x, context=None, mask=None, q_pos=None, kv_pos=None, use_cache=False, is_causal=True):
+        if self.share_weights:
+            block = self.blocks[0]
+            for _ in range(self.num_blocks):
+                x = block(x, context=context, mask=mask, q_pos=q_pos, kv_pos=kv_pos, use_cache=use_cache, is_causal=is_causal)
+        else:
+            for block in self.blocks:
+                x = block(x, context=context, mask=mask, q_pos=q_pos, kv_pos=kv_pos, use_cache=use_cache, is_causal=is_causal)
         return x
 
 
 class UniversalReasoner(nnx.Module):
-    def __init__(self, latent_dim, rngs, num_blocks=NUM_BLOCKS, dtype=jnp.bfloat16, use_forget=True):
+    def __init__(self, latent_dim, rngs, num_blocks=NUM_BLOCKS, dtype=jnp.float32, use_forget=True):
         self.latent_dim = latent_dim
         self.embed = nnx.Embed(VOCAB_SIZE, latent_dim, dtype=dtype, rngs=rngs)
         self.time_embed = nnx.Embed(MAX_STEPS_LIMIT + 1, latent_dim, dtype=dtype, rngs=rngs)
 
         self.shared_token = nnx.Param(
-            jax.nn.initializers.orthogonal()(rngs(), (1, SHARED_SLOTS, latent_dim), dtype)
+            jax.nn.initializers.orthogonal()(rngs(), (1, SHARED_SLOTS, latent_dim), jnp.float32)
         )
 
         self.seq_norm = nnx.RMSNorm(latent_dim, rngs=rngs, dtype=dtype)
-        self.main_stack = BlockStack(num_blocks, latent_dim, num_heads=16, rngs=rngs, dtype=dtype)
+        
+        self.coder_stack = BlockStack(num_blocks, latent_dim, num_heads=NUM_HEADS, rngs=rngs, dtype=dtype, share_weights=False)
+        self.reasoner_stack = BlockStack(num_blocks, latent_dim, num_heads=NUM_HEADS, rngs=rngs, dtype=dtype, share_weights=True)
+
+        self.encoder_stack = self.coder_stack
+        self.decoder_stack = self.coder_stack
+        
+        self.reasoning_stack = self.reasoner_stack
+
+        self.meta_proj = nnx.Linear(3, latent_dim, rngs=rngs, dtype=dtype)
 
         halt_pre_dim = latent_dim // 4
         self.halt_pre = nnx.Linear(latent_dim, halt_pre_dim, rngs=rngs, dtype=dtype)
         self.halt_head = nnx.Linear(halt_pre_dim, 1, dtype=jnp.float32, rngs=rngs)
         self.halt_head.bias.value = jnp.full((1,), -1.0) 
         
-        self.time_norm = nnx.RMSNorm(latent_dim, rngs=rngs, dtype=dtype)
-        self.forget_norm = nnx.RMSNorm(latent_dim, rngs=rngs, dtype=dtype)
-        self.time_signal_norm = nnx.RMSNorm(latent_dim, rngs=rngs, dtype=dtype)
+        self.time_norm = nnx.RMSNorm(latent_dim, epsilon=1e-6, rngs=rngs, dtype=dtype)
+        self.forget_norm = nnx.RMSNorm(latent_dim, epsilon=1e-6, rngs=rngs, dtype=dtype)
+        self.time_signal_norm = nnx.RMSNorm(latent_dim, epsilon=1e-6, rngs=rngs, dtype=dtype)
 
-        self.hunch_norm = nnx.RMSNorm(latent_dim, rngs=rngs, dtype=dtype)
+        self.hunch_norm = nnx.RMSNorm(latent_dim, epsilon=1e-6, rngs=rngs, dtype=dtype)
         self.hunch_gate = nnx.Linear(
             latent_dim, latent_dim,
             bias_init=jax.nn.initializers.constant(-2.0),
             rngs=rngs, dtype=dtype,
         )
 
+        self.raw_tau = nnx.Param(jnp.array(-2.3))
+
         self.use_forget = use_forget
         if self.use_forget:
-            self.forget_head = nnx.Linear(latent_dim, latent_dim, bias_init=jax.nn.initializers.constant(0.0), rngs=rngs, dtype=dtype)
+            self.forget_head = nnx.Linear(latent_dim, latent_dim, bias_init=jax.nn.initializers.constant(1.0), rngs=rngs, dtype=dtype)
 
-        self.hunch_cache = nnx.Cache(None)
+        self.hunch_cache = nnx.Variable(jnp.zeros((BATCH_SIZE, SHARED_SLOTS, latent_dim)))
 
 
-    def __call__(self, tokens, max_steps=MAX_STEPS_LIMIT, training=False, should_refresh=True, prev_hunch=None):
-        batch_size, seq_len = tokens.shape
-        
-        current_hunch = None
-        if training:
-            current_hunch = prev_hunch
-            self.main_stack.reset_state()
-        else:
-            self.main_stack.reset_state()
-            if not should_refresh and self.hunch_cache.value is not None:
-                current_hunch = self.hunch_cache.value
-                
-        seq_pos, shared_pos = jnp.arange(seq_len), jnp.arange(MAX_SEQ_LEN, MAX_SEQ_LEN + SHARED_SLOTS)
+    def _encode_sequence(self, tokens):
         pad_mask = tokens != PAD_TOKEN_ID
-        causal_mask = jnp.tril(jnp.ones((seq_len, seq_len), dtype=jnp.bool_))
-        seq_attn_mask = pad_mask[:, None, None, :] & causal_mask[None, None, :, :]
+        pad_bias = (pad_mask.astype(jnp.float32) - 1.0) * 1e9
+        pad_bias = pad_bias[:, None, None, :]
+        
+        seq_len = tokens.shape[1]
+        seq_pos = jnp.arange(seq_len)
+        
+        z_seq_base = self.embed(tokens)
+        z_seq = self.encoder_stack(z_seq_base, mask=pad_bias, q_pos=seq_pos, kv_pos=seq_pos, is_causal=True)
+        return z_seq, pad_mask, seq_pos
 
-        z_seq = self.embed(tokens)
-        z_seq = self.main_stack(z_seq, mask=seq_attn_mask, q_pos=seq_pos, kv_pos=seq_pos)
-
-        z_shared_base = jnp.tile(self.shared_token.value, (batch_size, 1, 1))
-
-        if current_hunch is not None:
-            gate = jax.nn.sigmoid(self.hunch_gate(self.hunch_norm(current_hunch)))
-            z_shared = gate * current_hunch + (1.0 - gate) * z_shared_base
-        else:
-            z_shared = z_shared_base
-
+    def _reasoning_loop(self, z_seq, pad_mask, seq_pos, max_steps, batch_size, z_shared):
+        shared_pos = jnp.arange(MAX_SEQ_LEN, MAX_SEQ_LEN + SHARED_SLOTS)
         all_time_embeds = self.time_embed(jnp.arange(max_steps))
         
-        # 1. Sequence part: all slots can see all valid sequence tokens
-        seq_mask = jnp.broadcast_to(
-            pad_mask[:, None, None, :], 
-            (batch_size, 1, SHARED_SLOTS, seq_len)
+        pad_part = (pad_mask.astype(jnp.float32) - 1.0) * 1e9
+        slot_part = jnp.zeros((batch_size, SHARED_SLOTS), dtype=jnp.float32)
+        extended_ctx_bias = jnp.concatenate([pad_part, slot_part], axis=-1)[:, None, None, :]
+
+        modules = (
+            self.meta_proj, self.time_norm, self.time_signal_norm, 
+            self.reasoning_stack, self.halt_pre, self.halt_head,
+            self.forget_norm if self.use_forget else None,
+            self.forget_head if self.use_forget else None,
+            self.raw_tau
         )
-        
-        # 2. Shared part: Causal mask so Slot N can only attend to Slots <= N
-        causal_shared = jnp.tril(jnp.ones((SHARED_SLOTS, SHARED_SLOTS), dtype=jnp.bool_))
-        shared_mask = jnp.broadcast_to(
-            causal_shared[None, None, :, :], 
-            (batch_size, 1, SHARED_SLOTS, SHARED_SLOTS)
-        )
-        
-        # Merge them to create the final mask for the scratchpad
-        extended_ctx_mask = jnp.concatenate([seq_mask, shared_mask], axis=-1)
+        model_graph, model_state = nnx.split(modules)
 
         def scan_step(carry, inputs):
-            curr_shared, p_remain_prev = carry
+            curr_shared, p_remain_prev, weighted_shared_acc, prev_forget, prev_div, current_state = carry
             t_signal, step_id = inputs
+            
+            (
+                m_proj, t_norm, ts_norm, 
+                r_stack, h_pre, h_head,
+                f_norm, f_head, raw_tau_param
+            ) = nnx.merge(model_graph, current_state)
+            
+            meta_input = jnp.stack([p_remain_prev, prev_forget, prev_div], axis=-1)
+            meta_signal = m_proj(meta_input)[:, None, :]
             
             shared_ctx = jnp.concatenate([z_seq, curr_shared], axis=1)
             shared_kv_pos = jnp.concatenate([seq_pos, shared_pos])
 
-            stack_input = self.time_norm(curr_shared) + self.time_signal_norm(t_signal[None, None, :])
-            
-            new_shared = self.main_stack(
-                stack_input, context=shared_ctx, mask=extended_ctx_mask,
-                q_pos=shared_pos, kv_pos=shared_kv_pos
-            )
+            stack_input = t_norm(curr_shared) + ts_norm(t_signal[None, None, :]) + meta_signal
+            new_shared = r_stack(stack_input, context=shared_ctx, mask=extended_ctx_bias, q_pos=shared_pos, kv_pos=shared_kv_pos, is_causal=False)
 
             if self.use_forget:
-                forget_gate_input = self.forget_norm(new_shared)
-                forget = jax.nn.sigmoid(self.forget_head(forget_gate_input))
+                forget = jax.nn.sigmoid(f_head(f_norm(new_shared)))
                 new_shared = forget * new_shared + (1.0 - forget) * curr_shared
                 forget_val = jnp.mean(jnp.abs(forget), axis=(1, 2))
             else:
-                forget_val = 0.0
-            
+                forget_val = jnp.zeros((batch_size,))
+
+            storage_val = jnp.mean(jnp.abs(new_shared), axis=(1, 2))
+
             pooled = jnp.mean(new_shared, axis=1)
-            halt_logits = self.halt_head(jax.nn.gelu(self.halt_pre(pooled))).squeeze(-1)
-            halt_prob = jax.nn.sigmoid(halt_logits)
-            halt_prob = jnp.where(step_id < MIN_STEPS, 0.0, halt_prob)
-            
+            halt_logit = h_head(jax.nn.gelu(h_pre(pooled))).squeeze(-1)
+            halt_prob = jax.nn.sigmoid(halt_logit)
+            halt_prob = jnp.where(step_id < MIN_STEPS, 0.0, jnp.clip(halt_prob, 0.0, 1.0 - 1e-7))
+
+            step_weight = halt_prob * p_remain_prev
             p_remain_next = p_remain_prev * (1.0 - halt_prob)
-            return (new_shared, p_remain_next), (new_shared, halt_prob, forget_val, halt_logits)
+            weighted_shared_acc = weighted_shared_acc + step_weight[:, None, None] * new_shared
 
-        (final_shared, _), (all_shared, all_halts, all_forget_l1, all_logits) = jax.lax.scan(
-            jax.checkpoint(scan_step), (z_shared, jnp.ones((batch_size,))), (all_time_embeds, jnp.arange(max_steps))
-        )
+            tau = jax.nn.softplus(raw_tau_param.value) + 1e-4
 
+            step_div = calculate_infonce_loss(new_shared, curr_shared, tau)
 
-        all_halts = jnp.clip(all_halts, 0.0, 1.0 - 1e-7)
-        
-        p_remain = jnp.concatenate(
-            [jnp.ones((1, batch_size)), jnp.cumprod(1.0 - all_halts, axis=0)[:-1]], axis=0
-        )
-        
-        step_weights = all_halts * p_remain
-        last_step_extra = p_remain[-1] * (1.0 - all_halts[-1])
-        step_weights = step_weights.at[-1].add(last_step_extra)
+            _, next_state = nnx.split((m_proj, t_norm, ts_norm, r_stack, h_pre, h_head, f_norm, f_head, raw_tau_param))
 
-        weights_for_shared = step_weights[:, :, None, None]
-        expected_shared = jnp.sum(weights_for_shared * all_shared, axis=0)
+            return (new_shared, p_remain_next, weighted_shared_acc, forget_val, step_div, next_state), ScanStepOutput(
+                shared_state=new_shared,
+                halt_prob=halt_prob, forget_val=forget_val, storage_val=storage_val,
+                halt_logit=halt_logit, step_div=step_div, step_weight=step_weight
+            )
 
-        step_indices = jnp.arange(1, max_steps + 1)[:, None]
-        
-        actual_steps = jnp.sum(step_weights * step_indices, axis=0) 
-
-        ponder_cost = jnp.sum(step_weights * jnp.maximum(0, step_indices - MIN_STEPS), axis=0)
-        forget_loss = jnp.sum(step_weights * all_forget_l1, axis=0)
-        
-        norms = jnp.sqrt(jnp.sum(jnp.square(expected_shared), axis=-1, keepdims=True) + 1e-8)
-        normalized = expected_shared / norms
-        slot_corr = jnp.einsum('bsd,btd->bst', normalized, normalized)
-        saturation_score = jnp.mean(jnp.abs(slot_corr))
-
-        diff_sq = jnp.sum(jnp.square(all_shared[-1] - all_shared[0]), axis=-1)
-        base_sq = jnp.sum(jnp.square(all_shared[0]), axis=-1)
-        drift = jnp.mean(jnp.sqrt(diff_sq + 1e-8) / (jnp.sqrt(base_sq + 1e-8)))
-
-        forget_density = jnp.mean(all_forget_l1)
-        logit_spread = jnp.max(all_logits) - jnp.min(all_logits)
-
-        halt_diag = {
-            'logits_mean': jnp.mean(all_logits),
-            'logits_std': jnp.std(all_logits),
-            'logits_min': jnp.min(all_logits),
-            'logits_max': jnp.max(all_logits),
-            'prob_std': jnp.std(all_halts),
-            'saturation': saturation_score,
-            'temporal_drift': drift,
-            'forget_density': forget_density,
-            'logit_spread': logit_spread,
-        }
-
-        halt_diag.update({
-            'prob_mean': jnp.mean(actual_steps),
-            'actual_steps': jnp.mean(actual_steps) 
-        })
-
-        z_out = self.main_stack(
-            z_seq, 
-            context=expected_shared, 
-            mask=jnp.ones((batch_size, 1, 1, SHARED_SLOTS), dtype=jnp.bool_), 
-            q_pos=seq_pos, 
-            kv_pos=shared_pos
+        init_weighted_shared = jnp.zeros_like(z_shared)
+        init_carry = (
+            z_shared, 
+            jnp.ones((batch_size,)), 
+            init_weighted_shared,
+            jnp.zeros((batch_size,)),
+            jnp.zeros((batch_size,)),
+            model_state
         )
         
-        logits = self.seq_norm(z_out) @ self.embed.embedding.value.T
+        final_carry_all, all_outputs = jax.lax.scan(
+            jax.checkpoint(scan_step), init_carry, (all_time_embeds, jnp.arange(max_steps))
+        )
+
+        final_carry = (final_carry_all[0], final_carry_all[1], final_carry_all[2])
+        return final_carry, all_outputs, shared_pos
+
+    def _compute_ponder_kl(self, step_weights, p_remain_final, max_steps):
+        step_ids = jnp.arange(1, max_steps + 1)[:, None]
+        full_step_weights = step_weights.at[-1].add(p_remain_final)
+
+        lambda_p = 0.1
+        active_steps = jnp.maximum(0, step_ids - MIN_STEPS)
+        prior_prob = lambda_p * ((1.0 - lambda_p) ** active_steps)
+        valid_steps_mask = (step_ids >= MIN_STEPS).astype(jnp.float32)
+
+        prior_prob = (prior_prob * valid_steps_mask)
+        prior_prob = prior_prob / (jnp.sum(prior_prob, axis=0, keepdims=True) + 1e-8)
+
+        p_x = full_step_weights + 1e-8 
+        q_x = prior_prob + 1e-8
+
+        kl_div_per_step = p_x * (jnp.log(p_x) - jnp.log(q_x))
+        kl_div_per_batch = jnp.sum(kl_div_per_step * valid_steps_mask, axis=0)
+        return jnp.mean(kl_div_per_batch), full_step_weights
+
+    def __call__(self, tokens, max_steps=MAX_STEPS_LIMIT, training=False, should_refresh=True):
+        batch_size = tokens.shape[0]
+        self.encoder_stack.reset_state()
+        self.reasoning_stack.reset_state()
+        self.decoder_stack.reset_state()
         
-        if not training:
-            self.hunch_cache.value = expected_shared
+        z_seq, pad_mask, seq_pos = self._encode_sequence(tokens)
+
+        z_shared_base = jnp.tile(self.shared_token.value, (batch_size, 1, 1))
+        
+        def get_fresh():
+            return z_shared_base
             
-        return logits, ponder_cost, forget_loss, halt_diag, expected_shared
+        def get_carried():
+            current_hunch = self.hunch_cache.value
+            gate = jax.nn.sigmoid(self.hunch_gate(self.hunch_norm(current_hunch)))
+            return gate * current_hunch + (1.0 - gate) * z_shared_base
+        
+        z_shared = jax.lax.cond(should_refresh, get_fresh, get_carried)
 
+        past_shared_pos = jnp.arange(-SHARED_SLOTS, 0)
+        
+        decoder_kv_pos = jnp.concatenate([seq_pos, past_shared_pos], axis=0)
+        
+        decoder_pad_mask = jnp.concatenate([pad_mask, jnp.ones((batch_size, SHARED_SLOTS), dtype=jnp.bool_)], axis=1)
+        decoder_bias = (decoder_pad_mask.astype(jnp.float32) - 1.0) * 1e9
+        decoder_bias = decoder_bias[:, None, None, :]
 
-
-schedule = optax.warmup_cosine_decay_schedule(
-    init_value=1e-6, 
-    peak_value=2e-4,  # Slightly lower peak for stability
-    warmup_steps=400, 
-    decay_steps=2000, 
-    end_value=1e-5
-)
-ponder_lambda_schedule = optax.warmup_cosine_decay_schedule(
-    init_value=0.0, 
-    peak_value=0.0, 
-    warmup_steps=400, 
-    decay_steps=1000, 
-    end_value=2e-4
-)
-optimizer_chain = optax.chain(
-    optax.clip_by_global_norm(1.0),
-    optax.adamw(learning_rate=schedule),
-)
-
-
-def calculate_diversity_loss(expected_shared):
-    expected_shared = expected_shared.astype(jnp.float32)
-    norms = jnp.sqrt(jnp.sum(jnp.square(expected_shared), axis=-1, keepdims=True) + 1e-8)
-    normalized_shared = expected_shared / norms
-    
-    dots = jnp.einsum('bsd,btd->bst', normalized_shared, normalized_shared)
-    
-    identity = jnp.eye(SHARED_SLOTS)[None, :, :]
-    
-    return jnp.mean(jnp.square(dots - identity))
-
-@nnx.jit
-def train_step(model, opt, batch_tokens, step, f_lambda, prev_hunch=None, should_truncate=False):
-    def loss_fn(model):
-        inputs, targets = batch_tokens[:, :-1], batch_tokens[:, 1:]
-
-        preds, ponder_cost, forget_cost, halt_diag, expected_shared = model(
-            inputs, training=True, prev_hunch=prev_hunch
+        final_carry, all_outputs, shared_pos = self._reasoning_loop(z_seq, pad_mask, seq_pos, max_steps, batch_size, z_shared)
+        final_shared, p_remain_final, weighted_shared_acc = final_carry
+        
+        expected_shared = weighted_shared_acc + p_remain_final[:, None, None] * final_shared
+        
+        decoder_ctx_final = jnp.concatenate([z_seq, expected_shared], axis=1)
+        
+        z_seq_out = self.decoder_stack(
+            z_seq, 
+            context=decoder_ctx_final, 
+            mask=decoder_bias, 
+            q_pos=seq_pos, 
+            kv_pos=decoder_kv_pos,
+            is_causal=True
         )
-        div_loss = calculate_diversity_loss(expected_shared)
+        logits = self.seq_norm(z_seq_out) @ self.embed.embedding.value.T
+        
+        total_p_cost, full_step_weights = self._compute_ponder_kl(all_outputs.step_weight, p_remain_final, max_steps)
+        
+        total_f_cost = jnp.mean(jnp.sum(full_step_weights * all_outputs.forget_val, axis=0))
+        total_s_cost = jnp.mean(jnp.sum(full_step_weights * all_outputs.storage_val, axis=0))
+        total_div_cost = jnp.mean(jnp.sum(jax.lax.stop_gradient(full_step_weights) * all_outputs.step_div, axis=0))
+        
+        actual_steps = jnp.sum(full_step_weights * jnp.arange(1, max_steps + 1)[:, None], axis=0)
 
-        ce_loss = optax.softmax_cross_entropy_with_integer_labels(logits=preds, labels=targets)
-        non_pad_mask = (targets != PAD_TOKEN_ID)
-        num_valid = jnp.sum(non_pad_mask).clip(min=1)
-        token_loss = jnp.sum(ce_loss * non_pad_mask) / num_valid
+        states = all_outputs.shared_state
+        diffs = states[1:] - states[:-1]
+        temporal_drift = jnp.mean(jnp.sqrt(jnp.sum(jnp.square(diffs), axis=-1) + 1e-8))
+        
+        halt_diag = {
+            'ponder_kl': total_p_cost,
+            'expected_steps': jnp.mean(actual_steps),
+            'temporal_drift': temporal_drift,
+            'forget_density': jnp.mean(all_outputs.forget_val),
+            'saturation': jnp.mean(p_remain_final) * 100.0,
+            'tau': jax.nn.softplus(self.raw_tau.value) + 1e-4,
+        }
+        
+        self.hunch_cache.value = expected_shared
 
-        current_p_lambda = ponder_lambda_schedule(step)
-
-        num_devices = jax.device_count()
-
-        total_loss = (
-            token_loss
-            + current_p_lambda * jnp.mean(ponder_cost)
-            + f_lambda * jnp.mean(forget_cost)
-            + DIVERSITY_LAMBDA * div_loss
+        return ReasonerOutput(
+            logits=logits, ponder_cost=total_p_cost, forget_cost=total_f_cost,
+            storage_cost=total_s_cost, diversity_loss=total_div_cost,
+            halt_diag=halt_diag, expected_shared=expected_shared
         )
-        
-        total_loss = jnp.where(jnp.isfinite(total_loss), total_loss, 0.0)
-        total_loss = total_loss / num_devices
-        
-        halt_diag['diversity_loss'] = div_loss
-        
-        return total_loss, (token_loss, jnp.mean(ponder_cost), jnp.mean(forget_cost), halt_diag, expected_shared)
 
-    (loss, aux), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
-    opt.update(grads)
+def calculate_infonce_loss(new_shared, curr_shared, tau):
+    b, s, d = new_shared.shape
     
-    *metrics, next_hunch = aux
-    
-    # If should_truncate is True, we break the gradient chain here.
-    # Also, we break it if the global step says so.
-    should_refresh = should_truncate | (step % HUNCH_REFRESH_EVERY == 0)
-    
-    next_hunch = jax.lax.cond(
-        should_refresh,
-        lambda x: jax.lax.stop_gradient(x),
-        lambda x: x,
-        next_hunch
+    anchor = new_shared / jnp.sqrt(jnp.sum(jnp.square(new_shared), axis=-1, keepdims=True) + 1e-8)
+    positive = jax.lax.stop_gradient(
+        curr_shared / jnp.sqrt(jnp.sum(jnp.square(curr_shared), axis=-1, keepdims=True) + 1e-8)
     )
     
-    return loss, tuple(metrics), next_hunch
+    pos_logits = jnp.sum(anchor * positive, axis=-1, keepdims=True) / tau
+    
+    neg_logits = jnp.einsum('bsd,btd->bst', anchor, anchor, precision=jax.lax.Precision.HIGHEST) / tau
+    
+    identity = jnp.eye(s)[None, :, :]
+    neg_logits = neg_logits + (identity * -1e9)
+    logits = jnp.concatenate([pos_logits, neg_logits], axis=-1)
+    
+    labels = jnp.zeros((b, s), dtype=jnp.int32)
+    
+    loss_per_slot = optax.softmax_cross_entropy_with_integer_labels(logits, labels)
+    
+    return jnp.mean(loss_per_slot, axis=-1)
+
+@nnx.jit
+def compute_grad_step(model, batch_tokens, step, should_truncate=False):
+    should_refresh = jnp.any(should_truncate).squeeze()
+
+    def loss_fn(model):
+        def compute_ce(logits, targets):
+            mask = targets != PAD_TOKEN_ID
+            return jnp.sum(optax.softmax_cross_entropy_with_integer_labels(logits=logits, labels=targets) * mask) / jnp.sum(mask).clip(min=1)
+
+        seq1_in, seq1_out = batch_tokens[:, :MAX_SEQ_LEN], batch_tokens[:, 1:MAX_SEQ_LEN+1]
+        seq2_in, seq2_out = batch_tokens[:, MAX_SEQ_LEN:2*MAX_SEQ_LEN], batch_tokens[:, MAX_SEQ_LEN+1:2*MAX_SEQ_LEN+1]
+
+        out1 = model(seq1_in, training=True, should_refresh=should_refresh)
+        ce1 = compute_ce(out1.logits, seq1_out)
+        
+        out2 = model(seq2_in, training=True, should_refresh=False)
+        ce2 = compute_ce(out2.logits, seq2_out)
+
+        from schedules import ponder_lambda_schedule, forget_lambda_schedule, storage_lambda_schedule, diversity_lambda_schedule
+        opt_step = step // ACCUMULATION_STEPS
+        p_lambda = ponder_lambda_schedule(opt_step)
+        f_lambda = forget_lambda_schedule(opt_step)
+        s_lambda = storage_lambda_schedule(opt_step)
+        d_lambda = diversity_lambda_schedule(opt_step)
+
+        total_loss = (ce1 + ce2) + p_lambda * (out1.ponder_cost + out2.ponder_cost) + f_lambda * (out1.forget_cost + out2.forget_cost) + s_lambda * (out1.storage_cost + out2.storage_cost) + d_lambda * (out1.diversity_loss + out2.diversity_loss)
+        total_loss = jnp.where(jnp.isfinite(total_loss), total_loss, 0.0)
+        
+        new_halt_diag = {
+            **out2.halt_diag,
+            'ce1': jax.lax.stop_gradient(ce1),
+            'token_loss': jax.lax.stop_gradient(ce2),
+        }
+        out2 = out2.replace(logits=None, halt_diag=new_halt_diag)
+        return total_loss, out2
+
+    (loss, out), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
+    
+    current_hunch = model.hunch_cache.value
+    cleared_hunch = jnp.zeros_like(current_hunch)
+    
+    # After the step, we carry forward the hunch UNLESS a truncation was requested
+    carried_hunch = jax.lax.cond(
+        should_refresh,
+        lambda: jax.lax.stop_gradient(cleared_hunch),
+        lambda: jax.lax.stop_gradient(current_hunch)
+    )
+    
+    model.hunch_cache.value = carried_hunch
+
+    sq_norms = jax.tree_util.tree_map(lambda x: jnp.sum(jnp.square(x)), grads)
+    grad_norm = jnp.sqrt(sum(jax.tree_util.tree_leaves(sq_norms)))
+    
+    return loss, out, grads, grad_norm
+
+
+@nnx.jit
+def apply_grads(opt, grads, model):
+    opt.update(model, grads)
