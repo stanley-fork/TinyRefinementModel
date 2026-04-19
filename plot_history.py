@@ -12,7 +12,6 @@ from train_local import (
     VOCAB_SIZE, 
     SHARED_SLOTS, 
     MAX_STEPS_LIMIT,
-    ACCUMULATION_STEPS,
     NUM_HEADS,
     NUM_GROUPS
 )
@@ -51,7 +50,9 @@ def print_model_stats():
     k_params = LATENT_DIM * (NUM_GROUPS * head_dim) + (NUM_GROUPS * head_dim)
     v_params = LATENT_DIM * (NUM_GROUPS * head_dim) + (NUM_GROUPS * head_dim)
     o_params = LATENT_DIM * LATENT_DIM + LATENT_DIM
-    attn_total = q_params + k_params + v_params + o_params
+    
+    attn_norms = head_dim * 2
+    attn_total = q_params + k_params + v_params + o_params + attn_norms
     
     hidden_dim = int(256 * ((LATENT_DIM * 8 / 3 + 255) // 256))
     gate_params = LATENT_DIM * hidden_dim + hidden_dim
@@ -61,13 +62,25 @@ def print_model_stats():
     
     block_norms = LATENT_DIM * 2
     params_per_block = attn_total + mlp_total + block_norms
-    num_reason_param = params_per_block * NUM_BLOCKS
     
-    # 2. Universal Reasoner Extras
+    num_enc_blocks = NUM_BLOCKS // 2
+    num_dec_blocks = NUM_BLOCKS // 2
+    num_reasoning_blocks = 1
+    
+    unique_blocks = num_enc_blocks + num_dec_blocks + num_reasoning_blocks
+    
+    enc_params = params_per_block * num_enc_blocks
+    dec_params = params_per_block * num_dec_blocks
+    reason_params = params_per_block * num_reasoning_blocks
+    
+    num_layer_params = enc_params + dec_params + reason_params
+    
     embed = VOCAB_SIZE * LATENT_DIM
     time_embed = (MAX_STEPS_LIMIT + 1) * LATENT_DIM
     shared_token = SHARED_SLOTS * LATENT_DIM
     seq_norm = LATENT_DIM
+    
+    meta_proj = 3 * LATENT_DIM + LATENT_DIM
     
     halt_pre_dim = LATENT_DIM // 4
     halt_pre = LATENT_DIM * halt_pre_dim + halt_pre_dim
@@ -77,14 +90,19 @@ def print_model_stats():
     hunch_gate = LATENT_DIM * LATENT_DIM + LATENT_DIM
     forget_head = LATENT_DIM * LATENT_DIM + LATENT_DIM 
     
-    encoder_params = (embed + time_embed + shared_token + seq_norm + 
-                      halt_pre + halt_head + extra_norms + hunch_gate + forget_head)
+    tau_param = 1
     
-    param_count = num_reason_param + encoder_params
+    structure_params = (embed + time_embed + shared_token + seq_norm + meta_proj + 
+                        halt_pre + halt_head + extra_norms + hunch_gate + forget_head + tau_param)
+    
+    param_count = num_layer_params + structure_params
     
     print(f"Model Parameters: {param_count:,}")
-    print(f"  |-- Encoder Params : {encoder_params:,}")
-    print(f"  |-- Layer Params   : {num_reason_param:,} (across {NUM_BLOCKS} blocks)")
+    print(f"  |-- Structure Params : {structure_params:,} (Embeddings, Norms, Heads)")
+    print(f"  |-- Unique Layer Params : {num_layer_params:,} (across {unique_blocks} unique blocks)")
+    print(f"      |-- Encoder Stack   : {enc_params:,} ({num_enc_blocks} blocks)")
+    print(f"      |-- Decoder Stack   : {dec_params:,} ({num_dec_blocks} blocks)")
+    print(f"      |-- Reasoning Stack : {reason_params:,} (1 shared block)")
 
 def plot_training_history(log_path="training_history.csv"):
     if not os.path.exists(log_path):
