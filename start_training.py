@@ -192,7 +192,6 @@ def train_loop(model, optimizer, data_queue, mngr, monitor, start_step, sft_phas
     
     accum_loss = 0.0
     accum_token_loss = 0.0
-    accum_p = 0.0
     accum_forget_cost = 0.0
     accum_storage_cost = 0.0
     accum_grad_norm = 0.0
@@ -217,7 +216,6 @@ def train_loop(model, optimizer, data_queue, mngr, monitor, start_step, sft_phas
         # Force JAX to resolve the array into a Python float instantly
         current_loss = float(loss)
         current_token_loss = float(out.halt_diag.get('token_loss', loss))
-        current_p = float(out.ponder_cost)
         current_forget = float(out.forget_cost)
         current_storage = float(out.storage_cost)
         current_grad_norm = float(grad_norm)
@@ -225,7 +223,6 @@ def train_loop(model, optimizer, data_queue, mngr, monitor, start_step, sft_phas
         # Now accumulate the pure Python floats
         accum_loss += current_loss / LOG_EVERY
         accum_token_loss += current_token_loss / LOG_EVERY
-        accum_p += current_p / LOG_EVERY
         accum_forget_cost += current_forget / LOG_EVERY
         accum_storage_cost += current_storage / LOG_EVERY
         accum_grad_norm += current_grad_norm / LOG_EVERY
@@ -285,7 +282,6 @@ def train_loop(model, optimizer, data_queue, mngr, monitor, start_step, sft_phas
             
             accum_loss = 0.0
             accum_token_loss = 0.0
-            accum_p = 0.0
             accum_forget_cost = 0.0
             accum_storage_cost = 0.0
             accum_grad_norm = 0.0
