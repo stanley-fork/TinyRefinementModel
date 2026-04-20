@@ -119,7 +119,6 @@ def plot_training_history(log_path="training_history.csv"):
                         'first_ce': float(row.get('first_ce', 0)),
                         'diversity': float(row.get('diversity_loss', 0)),
                         'forget_cost': float(row.get('avg_forget_cost', 0)),
-                        'storage_cost': float(row.get('avg_storage_cost', 0)),
                         'grad_norm': float(row.get('grad_norm_avg', 0)),
                         'temporal_drift': float(row.get('temporal_drift', 0)),
                     })
@@ -139,7 +138,6 @@ def plot_training_history(log_path="training_history.csv"):
     first_ce = np.array([e['first_ce'] for e in history])
     diversity = np.array([e['diversity'] for e in history])
     forget = np.array([e['forget_cost'] for e in history])
-    storage = np.array([e['storage_cost'] for e in history])
     grad_norm = np.array([e['grad_norm'] for e in history])
     temporal_drift = np.array([e['temporal_drift'] for e in history])
 
@@ -171,7 +169,6 @@ def plot_training_history(log_path="training_history.csv"):
 
     # --- 3. RESOURCE COSTS (Forget & Storage) ---
     ax3.plot(steps, smooth(forget, smoothing_window), color='#00ff88', linewidth=2, label='Forget Cost')
-    ax3.plot(steps, smooth(storage, smoothing_window), color='#00f2ff', linewidth=2, label='Storage Cost')
     ax3.set_title('Dynamic Resource Penalties', fontsize=14, fontweight='bold')
     ax3.set_xlabel('Training Step')
     ax3.set_ylabel('Cost Value')

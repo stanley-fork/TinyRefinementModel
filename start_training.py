@@ -193,9 +193,7 @@ def train_loop(model, optimizer, data_queue, mngr, monitor, start_step, sft_phas
     accum_loss = 0.0
     accum_token_loss = 0.0
     accum_forget_cost = 0.0
-    accum_storage_cost = 0.0
     accum_grad_norm = 0.0
-    t0_batch = time.time()
     t_compute = 0.0
     
     while True:
@@ -217,14 +215,12 @@ def train_loop(model, optimizer, data_queue, mngr, monitor, start_step, sft_phas
         current_loss = float(loss)
         current_token_loss = float(out.halt_diag.get('token_loss', loss))
         current_forget = float(out.forget_cost)
-        current_storage = float(out.storage_cost)
         current_grad_norm = float(grad_norm)
 
         # Now accumulate the pure Python floats
         accum_loss += current_loss / LOG_EVERY
         accum_token_loss += current_token_loss / LOG_EVERY
         accum_forget_cost += current_forget / LOG_EVERY
-        accum_storage_cost += current_storage / LOG_EVERY
         accum_grad_norm += current_grad_norm / LOG_EVERY
             
         if (step + 1) % LOG_EVERY == 0:
@@ -283,7 +279,6 @@ def train_loop(model, optimizer, data_queue, mngr, monitor, start_step, sft_phas
             accum_loss = 0.0
             accum_token_loss = 0.0
             accum_forget_cost = 0.0
-            accum_storage_cost = 0.0
             accum_grad_norm = 0.0
             t_compute = 0.0
 
