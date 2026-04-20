@@ -313,7 +313,7 @@ class UniversalReasoner(nnx.Module):
             else:
                 forget_val = jnp.zeros((batch_size,))
 
-            storage_val = jnp.mean(jnp.abs(new_shared), axis=(1, 2))
+            storage_val = jnp.mean(jnp.square(new_shared), axis=(1, 2))
 
             tau = jax.nn.softplus(raw_tau_param.value) + 1e-4
 
@@ -411,9 +411,9 @@ class UniversalReasoner(nnx.Module):
 def calculate_infonce_loss(new_shared, curr_shared, tau):
     b, s, d = new_shared.shape
     
-    anchor = new_shared / jnp.sqrt(jnp.sum(jnp.square(new_shared), axis=-1, keepdims=True) + 1e-8)
+    anchor = new_shared / jnp.sqrt(jnp.sum(jnp.square(new_shared), axis=-1, keepdims=True) + 1e-5)
     positive = jax.lax.stop_gradient(
-        curr_shared / jnp.sqrt(jnp.sum(jnp.square(curr_shared), axis=-1, keepdims=True) + 1e-8)
+        curr_shared / jnp.sqrt(jnp.sum(jnp.square(curr_shared), axis=-1, keepdims=True) + 1e-5)
     )
     
     pos_logits = jnp.sum(anchor * positive, axis=-1, keepdims=True) / tau
