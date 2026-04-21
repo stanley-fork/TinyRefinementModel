@@ -33,64 +33,89 @@ def calculate_tokens(step):
     return step * BATCH_SIZE * (MAX_SEQ_LEN * 2)
 
 def print_model_stats():
-    print("Calculating model parameters (mathematical estimation)...")
+    print("Calculating model parameters & memory footprint...")
     
     head_dim = LATENT_DIM // NUM_HEADS
     
-    # 1. Block Stack (Per Block)
+    # --- Block Parameters ---
+    # Rotary Attention
+    # q, k, v projs are f16, o_proj is f16. Norms are f32.
     q_params = LATENT_DIM * LATENT_DIM + LATENT_DIM
     k_params = LATENT_DIM * (NUM_GROUPS * head_dim) + (NUM_GROUPS * head_dim)
     v_params = LATENT_DIM * (NUM_GROUPS * head_dim) + (NUM_GROUPS * head_dim)
     o_params = LATENT_DIM * LATENT_DIM + LATENT_DIM
+    attn_norms = head_dim * 2 # q_norm, k_norm
     
-    attn_norms = head_dim * 2
-    attn_total = q_params + k_params + v_params + o_params + attn_norms
-    
+    # MLP (gate, up are f16, down is f16. Norms are f32)
     hidden_dim = int(256 * ((LATENT_DIM * 8 / 3 + 255) // 256))
     gate_params = LATENT_DIM * hidden_dim + hidden_dim
     up_params = LATENT_DIM * hidden_dim + hidden_dim
     down_params = hidden_dim * LATENT_DIM + LATENT_DIM
-    mlp_total = gate_params + up_params + down_params
     
-    block_norms = LATENT_DIM * 2
-    params_per_block = attn_total + mlp_total + block_norms
+    block_norms = LATENT_DIM * 2 # Standard norm1, norm2
     
-    num_enc_blocks = 1
-    num_dec_blocks = 1
+    # Pointers to specific precisions (Bytes)
+    f16_per_block = (q_params + k_params + v_params + o_params + 
+                     gate_params + up_params + down_params)
+    f32_per_block = attn_norms + block_norms
+    
+    total_params_per_block = f16_per_block + f32_per_block
+    
+    # Unique Physical Blocks
+    num_enc_blocks = 1 # Shared
+    num_dec_blocks = 1 # Shared
     num_reasoning_blocks = NUM_BLOCKS
-    
     unique_blocks = num_enc_blocks + num_dec_blocks + num_reasoning_blocks
     
-    enc_params = params_per_block * num_enc_blocks
-    dec_params = params_per_block * num_dec_blocks
-    reason_params = params_per_block * num_reasoning_blocks
+    total_layer_params = total_params_per_block * unique_blocks
+    total_layer_bytes = (f16_per_block * 2 + f32_per_block * 4) * unique_blocks
     
-    num_layer_params = enc_params + dec_params + reason_params
-    
+    # --- Structural Parameters ---
     embed = VOCAB_SIZE * LATENT_DIM
     time_embed = (MAX_STEPS_LIMIT + 1) * LATENT_DIM
     shared_token = SHARED_SLOTS * LATENT_DIM
     seq_norm = LATENT_DIM
-    
     meta_proj = 2 * LATENT_DIM + LATENT_DIM
-    
-    extra_norms = LATENT_DIM * 4 
+    extra_norms = LATENT_DIM * 4 # time, forget, signal, hunch
     hunch_gate = LATENT_DIM * LATENT_DIM + LATENT_DIM
-    forget_head = LATENT_DIM * LATENT_DIM + LATENT_DIM 
-    
     tau_param = 1
+    forget_head = LATENT_DIM * LATENT_DIM + LATENT_DIM
     
+    # Most structural params are f32 by default in UniversalReasoner
     structure_params = (embed + time_embed + shared_token + seq_norm + meta_proj + 
-                        extra_norms + hunch_gate + forget_head + tau_param)
+                        extra_norms + hunch_gate + tau_param + forget_head)
+    structure_bytes = structure_params * 4
     
-    param_count = num_layer_params + structure_params
+    total_params = total_layer_params + structure_params
+    total_weight_bytes = total_layer_bytes + structure_bytes
     
-    print(f"Model Parameters: {param_count:,}")
-    print(f"  |-- Structure Params : {structure_params:,} (Embeddings, Norms, Heads)")
-    print(f"  |-- Unique Layer Params : {num_layer_params:,} (across {unique_blocks} unique blocks)")
-    print(f"      |-- Encoder Stack   : {enc_params:,} (Shared)")
-    print(f"      |-- Decoder Stack   : {dec_params:,} (Shared)")
-    print(f"      |-- Reasoning Stack : {reason_params:,} ({num_reasoning_blocks} Unique Blocks)")
+    # Optimizer State (AdamW: 2 f32 moments per parameter)
+    optimizer_bytes = total_params * 4 * 2
+    
+    # Gradients (f32)
+    gradient_bytes = total_params * 4
+    
+    # Activation Memory (Highly heuristic estimation)
+    # z_seq + reasoning states + attn scores for a single path
+    # (Batch * Seq * Dim * Blocks) + (Batch * Steps * Slots * Dim)
+    act_bytes_est = (BATCH_SIZE * MAX_SEQ_LEN * LATENT_DIM * 2 * NUM_BLOCKS * 2) # f16
+    act_bytes_est += (BATCH_SIZE * MAX_STEPS_LIMIT * SHARED_SLOTS * LATENT_DIM * 2) # f16
+    
+    total_vram_gb = (total_weight_bytes + optimizer_bytes + gradient_bytes + act_bytes_est) / (1024**3)
+
+    print(f"Model Parameters: {total_params:,}")
+    print(f"  |-- Structure Params  : {structure_params:,}")
+    print(f"  |-- Unique Layer Params : {total_layer_params:,} ({unique_blocks} unique blocks)")
+    print(f"      |-- Shared Encoder : {total_params_per_block:,}")
+    print(f"      |-- Shared Decoder : {total_params_per_block:,}")
+    print(f"      |-- Reasoning Stack: {total_params_per_block * NUM_BLOCKS:,} ({NUM_BLOCKS} Blocks)")
+    print("-" * 50)
+    print(f"ESTIMATED VRAM FOOTPRINT (Training)")
+    print(f"  |-- Weights (f16/f32) : {total_weight_bytes / (1024**2):.2f} MB")
+    print(f"  |-- Optimizer (AdamW) : {optimizer_bytes / (1024**2):.2f} MB")
+    print(f"  |-- Gradients (f32)   : {gradient_bytes / (1024**2):.2f} MB")
+    print(f"  |-- Activations (Est) : {act_bytes_est / (1024**2):.2f} MB")
+    print(f"  => TOTAL ESTIMATED   : {total_vram_gb:.2f} GB")
 
 def plot_training_history(log_path="training_history.csv"):
     if not os.path.exists(log_path):

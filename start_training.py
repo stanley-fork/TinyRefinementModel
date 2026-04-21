@@ -32,8 +32,7 @@ from metrics_logger import LossMonitor, MetricsLogger
 
 load_dotenv()
 
-LOG_EVERY = 250
-CHECKPOINT_INTERVAL = 1000
+LOG_REAL_STEPS = 5
 PREFETCH_SIZE = 128
 
 DATA_ROOT = os.path.abspath(os.environ.get("DATA_ROOT", ""))
@@ -218,23 +217,27 @@ def train_loop(model, optimizer, data_queue, mngr, monitor, start_step, sft_phas
         current_grad_norm = float(grad_norm)
 
         # Now accumulate the pure Python floats
-        accum_loss += current_loss / LOG_EVERY
-        accum_token_loss += current_token_loss / LOG_EVERY
-        accum_forget_cost += current_forget / LOG_EVERY
-        accum_grad_norm += current_grad_norm / LOG_EVERY
+        # Divide by the total number of micro-batches between logs
+        divisor = ACCUMULATION_STEPS * LOG_REAL_STEPS
+        accum_loss += current_loss / divisor
+        accum_token_loss += current_token_loss / divisor
+        accum_forget_cost += current_forget / divisor
+        accum_grad_norm += current_grad_norm / divisor
             
-        if (step + 1) % LOG_EVERY == 0:
+        if (step + 1) % (ACCUMULATION_STEPS * LOG_REAL_STEPS) == 0:
+            opt_step = (step + 1) // ACCUMULATION_STEPS
+            
             logger.log(
-                step + 1, 
+                opt_step, 
                 float(accum_token_loss),
                 float(accum_loss),
                 out,
-                t_compute / LOG_EVERY,
+                t_compute,
                 grad_norm_avg=float(accum_grad_norm),
                 first_ce=float(out.halt_diag.get('ce1', 0))
             )
             
-            if monitor.push(step, float(accum_token_loss), float(accum_loss)): 
+            if monitor.push(opt_step, float(accum_token_loss), float(accum_loss)): 
                 if not sft_phase_event.is_set():
                     sft_phase_event.set()
                     monitor.sft_start_step = step
@@ -251,7 +254,7 @@ def train_loop(model, optimizer, data_queue, mngr, monitor, start_step, sft_phas
                     monitor.best_ce = float("inf")
                     monitor.best_loss = float("inf")
                     monitor.best_avg_ce = float("inf")
-                    monitor.last_improvement_step = step
+                    monitor.last_improvement_step = opt_step
                 else:
                     print("🛑 Training halted: No improvement in CE during SFT phase.")
                     break
