@@ -67,7 +67,9 @@ optimizer_chain = optax.MultiSteps(
 )
 
 def create_sft_optimizer(model, old_opt=None):
+    import gc
     print("📉 Recreating optimizer with 10x LR penalty for SFT phase...")
+    
     sft_lr_schedule = lambda step: learning_schedule(step) * 0.1
     
     sft_chain = optax.MultiSteps(
@@ -82,10 +84,19 @@ def create_sft_optimizer(model, old_opt=None):
         every_k_schedule=ACCUMULATION_STEPS,
         use_grad_mean=True
     )
-    new_opt = nnx.Optimizer(model, sft_chain, wrt=nnx.Param)
+
     if old_opt is not None:
-        nnx.update(new_opt, nnx.state(old_opt))
-    return new_opt
+        state = nnx.state(old_opt)
+        
+        new_opt = nnx.Optimizer(model, sft_chain, wrt=nnx.Param)
+        
+        nnx.update(new_opt, state)
+        
+        del state
+        gc.collect()
+        return new_opt
+    
+    return nnx.Optimizer(model, sft_chain, wrt=nnx.Param)
 
 def load_or_create_checkpoint(model, optimizer):
     monitor = LossMonitor()
@@ -243,7 +254,11 @@ def train_loop(model, optimizer, data_queue, mngr, monitor, start_step, sft_phas
                     monitor.sft_start_step = step
                     
                     # Apply 10x Learning Rate Penalty for SFT
-                    optimizer = create_sft_optimizer(model, optimizer)
+                    import gc
+                    old_opt = optimizer
+                    optimizer = create_sft_optimizer(model, old_opt)
+                    del old_opt
+                    gc.collect()
                     
                     print("\n" + "🔄"*30)
                     print("🔄 CE Plateau Detected! Triggering SFT Chat Phase and decaying Learning Rate!")
@@ -303,7 +318,12 @@ if __name__ == "__main__":
     if getattr(monitor, "sft_start_step", None) is not None:
         print(f"🔄 Resuming in SFT phase (started at step {monitor.sft_start_step})")
         sft_phase_event.set()
-        optimizer = create_sft_optimizer(model, optimizer)
+        
+        import gc
+        old_opt = optimizer
+        optimizer = create_sft_optimizer(model, old_opt)
+        del old_opt
+        gc.collect()
 
     data_queue = setup_data_pipeline(start_step, sft_phase_event, getattr(monitor, "sft_start_step", None))
     
