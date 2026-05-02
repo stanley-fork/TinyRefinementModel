@@ -157,17 +157,17 @@ def setup_data_pipeline(start_step, sft_phase_event, sft_start_step=None):
 
     if start_step > 1:
         if sft_start_step is None or start_step < sft_start_step:
-            total_pretrain_seen = (start_step - 1) * ACCUMULATION_STEPS
+            total_pretrain_seen = (start_step - 1)
             for gen, weight in zip(pretrain_sources, pretrain_weights):
                 gen.skip_count = int(total_pretrain_seen * weight)
         else:
             # 1. Catch up pretrain sources to the point where pretraining ended
-            total_pre_pretrain_seen = (sft_start_step - 1) * ACCUMULATION_STEPS
+            total_pre_pretrain_seen = (sft_start_step - 1)
             for gen, weight in zip(pretrain_sources, pretrain_weights):
                 gen.skip_count = int(total_pre_pretrain_seen * weight)
             
             # 2. Add SFT usage for all blended sources (Chat + Replay)
-            total_sft_seen = (start_step - sft_start_step) * ACCUMULATION_STEPS
+            total_sft_seen = (start_step - sft_start_step)
             for gen, weight in zip(sft_sources, sft_weights):
                 gen.skip_count += int(total_sft_seen * weight)
 

@@ -21,33 +21,34 @@ class TextDataGenerator:
         self.is_new_file = False
 
     def _load_next_file(self):
-        if self.current_file_idx >= len(self.files):
-            self.exhausted = True
-            return False
-        
-        file_path = self.files[self.current_file_idx]
-        print(f"📖 Streaming {file_path} into VRAM...")
-        
-        with self.fs.open(file_path, 'rb') as f:
-            self.data = np.load(f)
+        while True:
+            if self.current_file_idx >= len(self.files):
+                self.exhausted = True
+                return False
             
-        self.pointer = 0
-        
-        if self.skip_count > 0:
-            # Skip logic must account for the doubled sequence length
-            stride = 2 * self.max_seq_len + 1
-            tokens_to_skip = self.skip_count * stride
-            if tokens_to_skip < len(self.data):
-                self.pointer = tokens_to_skip
-                self.skip_count = 0
-            else:
-                self.skip_count -= (len(self.data) // stride)
-                self.current_file_idx += 1
-                return self._load_next_file()
+            file_path = self.files[self.current_file_idx]
+            print(f"📖 Streaming {file_path} into VRAM...")
+            
+            with self.fs.open(file_path, 'rb') as f:
+                self.data = np.load(f)
                 
-        self.current_file_idx += 1
-        self.is_new_file = True
-        return True
+            self.pointer = 0
+            
+            if self.skip_count > 0:
+                # Skip logic must account for the doubled sequence length
+                stride = 2 * self.max_seq_len + 1
+                tokens_to_skip = self.skip_count * stride
+                if tokens_to_skip < len(self.data):
+                    self.pointer = tokens_to_skip
+                    self.skip_count = 0
+                else:
+                    self.skip_count -= (len(self.data) // stride)
+                    self.current_file_idx += 1
+                    continue  # Loop to load the next file
+                    
+            self.current_file_idx += 1
+            self.is_new_file = True
+            return True
 
     def get_batch(self, batch_size):
         if self.exhausted: return None, None
